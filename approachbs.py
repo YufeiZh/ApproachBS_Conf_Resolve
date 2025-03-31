@@ -5,15 +5,17 @@ This plugin adds terminal area (TRACON) operations to BlueSky.
 """
 import random
 import numpy as np
-from bluesky import core, traf, stack, sim
+from bluesky import core, stack, sim, traf
 from bluesky.tools.aero import ft, nm, kts, fpm
 from bluesky.tools.geo import qdrpos, latlondist, qdrdist
-from bluesky import navdatabase
+from bluesky import navdb
 
 # Constants
 DELETE_BELOW = 200  # Aircraft (except taking off) below this field elevation will be automatically deleted [ft].
 DELETE_DISTANCE = 5 # Aircraft (except arrival acf not in airspace yet) whose distance from the airspace is greater than
                     # this number will be automatically deleted [NM].
+FAP_ELEVATION = 2000    # Final approach point elevation [ft].
+GLIDE_SLOPE = 3.0   # Glide slope [deg].
 
 approach_bs = None
 
@@ -188,7 +190,7 @@ class Tracon:
     The class representing TRACON airspace.
 
     Member attributes:
-        active: Whether the TRACON is active or not
+        _active: Whether the TRACON is active or not
         identifier: TRACON identifier/name
         ctr_lat: Center latitude (degrees)
         ctr_lon: Center longitude (degrees)
@@ -196,26 +198,19 @@ class Tracon:
         bottom: Bottom altitude (ft)
         tracon_range: Radius of TRACON area (nm)
         elevation: Ground elevation (ft)
-        apt_id: List of airport IDs within TRACON
-        apt_lat: Dictionary mapping airport IDs to lists of airport latitudes
-        apt_lon: Dictionary mapping airport IDs to lists of airport longitudes
-        apt_ele: Dictionary mapping airport IDs to lists of airport elevations
-        runway_id: Dictionary mapping airport IDs to lists of runway IDs
-        runway_thres_lat: Dictionary mapping airport IDs to lists of runway threshold latitudes
-        runway_thres_lon: Dictionary mapping airport IDs to lists of runway threshold longitudes
-        runway_bearing: Dictionary mapping airport IDs to lists of runway headings
-        runway_length: Dictionary mapping airport IDs to lists of runway lengths
-        open_rwy_id: List of open runway IDs
-        depart_wp_id: Dictionary mapping airport IDs to lists of departure waypoint IDs
-        depart_wp_lat: Dictionary mapping airport IDs to lists of departure waypoint latitudes
-        depart_wp_lon: Dictionary mapping airport IDs to lists of departure waypoint longitudes
-        fap_lat: Dictionary mapping airport IDs to lists of final approach point latitudes
-        fap_lon: Dictionary mapping airport IDs to lists of final approach point longitudes
-        fap_alt: Dictionary mapping airport IDs to lists of final approach point altitudes
+        apt: Dictionary mapping airport IDs to an ndarray [lat, lon, ele]
+        runway_thres: Dictionary mapping airport IDs to dictinaries
+            runway_thres[apt_id]: Dictionary of runway IDs to an ndarray [lat, lon, bearing]
+        dep_rwy_id: List of open departure runway IDs, e.g., ["KATL 26L", "KATL 26R"]
+        arr_rwy_id: List of open arrival runway IDs, e.g., ["KATL 26L", "KATL 26R"]
+        depart_wp: Dictionary mapping departure waypoint IDs to an ndarray [lat, lon, ele], 
+            e.g., {"EAONE": ndarray([33.8744, -83.8000, 10000]), "WEONE": ndarray([33.52569, -85.1224, 10000])}
+        fap: Dictionary mapping airport IDs to dictionaries
+            fap[apt_id]: Dictionary of runway IDs to an ndarray [lat, lon, ele]
+        restrict: Dictionary mapping restricted area IDs to an ndarray of length 20
     """
     
     def __init__(self, 
-                 active=False,
                  identifier="DEFAULT", 
                  ctr_lat=0, 
                  ctr_lon=0,
@@ -223,74 +218,61 @@ class Tracon:
                  top=10000,
                  bottom=500,
                  apt_id=None,
-                 open_rwy_id=None,
-                 depart_wp_id=None,
-                 depart_wp_lat=None,
-                 depart_wp_lon=None):
+                 dep_rwy_id=None,
+                 arr_rwy_id=None,
+                 depart_wp=None,
+                 restrict=None,
+                 activate=False):
         """
-        Initialize a TRACON airspace.
+        Initialize the TRACON object.
         """
-        # TRACON status
-        self.active = False
+        self._active = False
 
-        # TRACON Name
         self.identifier = identifier
         
-        # Center location, elevation, airspace range, top altitude, bottom altitude
         self.ctr_lat = ctr_lat
         self.ctr_lon = ctr_lon
-        self.range = tracon_range
-        self.elevation = -200
         self.top = top
         self.bottom = bottom
+        self.range = tracon_range
+        self.elevation = 0
         
-        # Airport information
-        self.apt_id = apt_id if apt_id else []
-        self.apt_lat = None
-        self.apt_lon = None
-        self.apt_ele = None
-        
-        # Runway information
-        self.runway_id = None
-        self.runway_thres_lat = None
-        self.runway_thres_lon = None
-        self.runway_bearing = None
-        self.runway_length = None
-        self.open_rwy_id = open_rwy_id if open_rwy_id else []
-
-        # Departure waypoints
-        self.depart_wp_id = depart_wp_id if depart_wp_id else []
-        self.depart_wp_lat = depart_wp_lat if depart_wp_lat else {}
-        self.depart_wp_lon = depart_wp_lon if depart_wp_lon else {}
-        
-        # Final approach points
-        self.fap_lat = None
-        self.fap_lon = None
-        self.fap_alt = None
-
-        # Load airports, runways, FAPs information from the database
+        self.apt = dict()
         for apt in apt_id:
-            self._obtain_airport_info(apt)
+            self.apt[apt] = None
+        self.runway_thres = None
+
+        self.dep_rwy_id = dep_rwy_id
+        self.arr_rwy_id = arr_rwy_id
+        self.fap = None
+        self.depart_wp = depart_wp
+
+        self.restrict = restrict
 
         # Activate
-        if active:
-            if not self.activate_tracon():
-                raise ValueError("TRACON is not qualified to activate. Please check the parameters.")
+        if activate:
+            self.activate_tracon()
     
+
+    def is_active(self):
+        """ Check if the TRACON is active. """
+        return self._active
+
 
     def activate_tracon(self):
         """ Activate the TRACON if it is qualified. """
+
+        # Load airports, runways, FAPs information from the database
+        if not self._obtain_airport_info():
+            print(f"Warning: Failed to load information from database for at least one airport. TRACON will not be activated.")
+            return False
 
         if not self.identifier:
             print("Warning: TRACON identifier is not set. TRACON will not be activated.")
             return False
 
-        if self.ctr_lat < -180 or self.ctr_lat > 180:
-            print("Warning: TRACON center latitude is not valid. TRACON will not be activated.")
-            return False
-
-        if self.ctr_lon < -90 or self.ctr_lon > 90:
-            print("Warning: TRACON center longitude is not valid. TRACON will not be activated.")
+        if self.ctr_lat < -180 or self.ctr_lat > 180 or self.ctr_lon < -90 or self.ctr_lon > 90:
+            print("Warning: TRACON center position is not valid. TRACON will not be activated.")
             return False
 
         if self.range < 10 or self.range > 100:
@@ -301,16 +283,16 @@ class Tracon:
             print("Warning: TRACON top altitude is not valid ([3000, 18000] in ft). TRACON will not be activated.")
             return False
 
-        if self.bottom < DELETE_BELOW or self.bottom > 1500:
-            print(f"Warning: TRACON bottom altitude is not valid ([{DELETE_BELOW}, 1500] in ft). TRACON will not be activated.")
+        if self.bottom < DELETE_BELOW or self.bottom > self.top - 1000:
+            print(f"Warning: TRACON bottom altitude is not valid ([{DELETE_BELOW}, top altitude - 1000] in ft). TRACON will not be activated.")
             return False
 
-        if not self.apt_id:
-            print("Warning: TRACON does not have any airports. TRACON will not be activated.")
+        if not self.apt:
+            print("Warning: There is no valid airport. TRACON will not be activated.")
             return False
-        for apt in self.apt_id:
+        for apt in self.apt:
             if not self._is_valid_apt(apt):
-                print(f"Warning: Airport ID {apt} is not valid. TRACON will not be activated.")
+                print(f"Warning: Airport {apt} is not valid. TRACON will not be activated.")
                 return False
             
         if not self.open_rwy_id:
@@ -318,11 +300,11 @@ class Tracon:
             return False
         for open_rwy in self.open_rwy_id:
             apt, rwy = open_rwy.upper().split(" ")
-            if apt not in self.apt_id or rwy not in self.runway_id[apt]:
-                print(f"Warning: Open runway ID {open_rwy} is not valid. TRACON will not be activated.")
+            if apt not in self.apt or rwy not in self.runway_thres[apt]:
+                print(f"Warning: {open_rwy} is invalid. TRACON will not be activated.")
                 return False
             try:
-                _, fap_dist_from_ctr = qdrdist(self.ctr_lat, self.ctr_lon, self.fap_lat[apt][rwy], self.fap_lon[apt][rwy])
+                _, fap_dist_from_ctr = qdrdist(self.ctr_lat, self.ctr_lon, self.fap[apt][rwy][0], self.fap[apt][rwy][1])
             except KeyError:
                 print(f"Error: Final Approach Point of runway {open_rwy} is not valid. TRACON will not be activated.")
                 return False
@@ -330,7 +312,7 @@ class Tracon:
                 print(f"Warning: Final Approach Point of runway {open_rwy} is too close to the boundary (<2NM). TRACON will not be activated.")
                 return False
             
-        if not self.depart_wp_id:
+        if self.depart_wp is None or not self.depart_wp.any():
             print("Warning: TRACON does not have any departure waypoints. TRACON will not be activated.")
             return False
         for depart_wp in self.depart_wp_id:
@@ -345,20 +327,75 @@ class Tracon:
                 print(f"Warning: Departure waypoint ID {depart_wp} is too far. TRACON will not be activated.")
                 return False
             
-        self.active = True
+        self._active = True
         print(f"TRACON {self.identifier} is activated.")
         return True
 
 
+    def _random_departure_wp(self):
+        """
+        Generate departure waypoints.
+        """
+        pass
 
-    def _obtain_airport_info(self, apt_id):
+
+    def _obtain_airport_info(self):
         """
         Update airport, runway, fap info from the database.
         
         Args:
             apt_id: Airport ID to obtain information for
         """
-        pass
+        # Get airport information:
+        
+
+        # Get runway ids:
+        self.runway_id = dict()
+        try:
+            for apt in self.apt:
+                self.runway_id[apt] = list(navdb.rwythresholds[apt].keys())
+        except KeyError:
+            print(f"Error: Airport ID {apt} is not in database.")
+            return False
+        
+        # Get runway threshold lat, lon and bearing:
+        self.runway_thres = dict()
+        try:
+            for apt in self.apt_id:
+                self.runway_thres[apt] = navdb.rwythresholds[apt]
+        except KeyError:
+            print(f"Error: Airport ID {apt} is not in database.")
+            return False
+        
+        # Get final approach points:
+        self.fap = dict()
+        try:
+            for apt in self.apt_id:
+                self.fap[apt] = dict()
+                for rwy in self.runway_id[apt]:
+                    rwy_thres_lat, rwy_thres_lon, rwy_bearing = self.runway_thres[apt][rwy]
+                    fap_lat, fap_lon = self._calculate_fap(rwy_thres_lat, rwy_thres_lon, rwy_bearing)
+                    self.fap[apt][rwy] = np.array([fap_lat, fap_lon, self.apt_ele[apt] + FAP_ELEVATION], dtype=float)
+        except KeyError:
+            print(f"Error: Unable to load FAPs.")
+            return False
+
+        return True
+
+
+    def _calculate_fap(self, rwy_thres_lat, rwy_thres_lon, rwy_bearing):
+        """
+        Calculate the final approach point (FAP) based on runway threshold latitude, longitude, and bearing.
+        """
+
+        # Calculate bearing and distance from runway threshold to FAP
+        bearing_thres_to_fap = rwy_bearing + 180.0
+        dist_thres_to_fap = FAP_ELEVATION * ft / np.tan(np.radians(GLIDE_SLOPE)) / nm
+        
+        # Calculate FAP latitude and longitude
+        fap_lat, fap_lon = qdrpos(rwy_thres_lat, rwy_thres_lon, bearing_thres_to_fap, dist_thres_to_fap)
+        
+        return fap_lat, fap_lon
 
 
     def _is_valid_apt(self, apt_id):
@@ -372,21 +409,18 @@ class Tracon:
             bool: True if valid, False otherwise
         """
         if apt_id not in self.apt_id:
-            print(f"Warning: Airport ID {apt_id} is not in the TRACON list.")
+            print(f"Warning: Airport {apt_id} is not in the TRACON list.")
 
-        if apt_id not in self.apt_lat or apt_id not in self.apt_lon or apt_id not in self.apt_ele:
-            print(f"Warning: Airport ID {apt_id} information is not complete.")
+        if apt_id not in self.apt:
+            print(f"Warning: Airport {apt_id} information is not complete.")
             return False
 
-        _, dist_from_ctr = qdrdist(self.ctr_lat, self.ctr_lon, self.apt_lat[apt_id], self.apt_lon[apt_id])
+        _, dist_from_ctr = qdrdist(self.ctr_lat, self.ctr_lon, self.apt[apt_id][0], self.apt[apt_id][1])
         if dist_from_ctr > self.range:
+            print(f"Airport {apt_id} is out of range.")
             return False
 
         return True
-        
-
-
-
 
 
     def to_dict(self):
@@ -408,6 +442,7 @@ class Tracon:
         
         return dict_tracon
     
+
     @classmethod
     def from_dict(cls, dict_data):
         """
@@ -424,14 +459,29 @@ class Tracon:
         
         return instance
     
+
     def reload_from_dict(self, dict_data):
         """
         Reload TRACON from a dictionary.
         """
         for key, value in dict_data.items():
             setattr(self, key, value)
-        self.active = True
+        self.activate_tracon()
 
-    
 
+# List of airport codes for testing
+airport_codes = [
+    "KATL", "KLAX", "KORD", "EGLL", "RJTT", "LFPG", "OMDB", "ZSPD", "VHHH", "EDDF",
+    "WSSS", "KJFK", "RKSI", "VTBS", "KDFW", "LTBA", "EHAM", "WMKK", "VIDP", "KLAS",
+    "KSFO", "YSSY", "KSEA", "CYYZ", "SBGR", "LEMD", "UUEE", "FACT", "EKCH", "LIRF",
+    "YMML", "VABB", "RJAA", "KIAH", "EDDM", "KMIA", "LSZH", "OMAA", "KPHX", "LEBL",
+    "KEWR", "VTSF", "KPDX", "KDTW", "RCKH", "ZBAA", "RCTP", "KPHL", "KCLT", "SAEZ",
+    "MMMX", "LTAC", "LGAV", "BIKF", "EGKK", "RJOO", "KDEN", "LIMC", "TNCM", "CYUL",
+    "KMSY", "LOWW", "VECC", "EFHK", "KDCA", "SBGL", "ENGM", "KSTL", "LPPT", "KMCO",
+    "WIII", "VTBD", "LFPO", "RJCC", "ZGGG", "ZSHC", "VOBL", "VOTV", "KTPA", "LTFE",
+    "LIPZ", "EDDH", "EDLW", "EDDS", "LTAI", "LGTS", "LIRN", "LBSF", "LZIB", "EPWA",
+    "LJLJ", "EIDW", "LPPR", "LEAL", "ZSAM", "GCFV", "GCLP", "LPFR", "LGRP", "LGIR",
+    "LHBP", "LKPR", "EPKT", "LROP", "ZUUU", "HECA", "LOWI", "HAAB", "LFLL", "LTFJ",
+    "PANC", "LFBO", "CYVR", "EGCC"
+]
 
