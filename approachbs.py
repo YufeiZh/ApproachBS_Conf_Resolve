@@ -7,8 +7,10 @@ import random
 import numpy as np
 import bluesky as bs
 from bluesky import core, stack, sim, traf
+from bluesky.traffic.asas import ConflictDetection
+from bluesky.tools.areafilter import basic_shapes, deleteArea, defineArea, checkInside
 from bluesky.tools.aero import ft, nm, kts, fpm
-from bluesky.tools.geo import qdrpos, qdrdist, qdrdist_matrix
+from bluesky.tools.geo import qdrpos, qdrdist, qdrdist_matrix, kwikqdrdist_matrix
 from bluesky.navdatabase import Navdatabase
 
 # Constants
@@ -43,21 +45,34 @@ class ApproachBS(core.Entity):
     def __init__(self):
         super().__init__()
 
+        # Simulator settings
+        stack.stack("ASAS ON")
+
         self.mode = 'debug'         # Simulation mode: default, debug, or test
 
         # Tracon
         self.tracon = Tracon()
 
-        # Reward
-        self.total_reward = 0.0
+        # Conflict detectors
+        # Conflict in one minute
+        self.conflict_one_minute = MyConflictDetection()
+        self.conflict_one_minute.rpz_def = 5.0 * nm  # Horizontal separation [m]
+        self.conflict_one_minute.hpz_def = 1000.0 * ft  # Vertical separation [m]
+        self.conflict_one_minute.dtlookahead_def = 60.0  # Lookahead time [s]
+        # Conflict in three minutes
+        self.conflict_three_minute = MyConflictDetection()
+        self.conflict_three_minute.rpz_def = 5.0 * nm  # Horizontal separation [m]
+        self.conflict_three_minute.hpz_def = 1000.0 * ft  # Vertical separation [m]
+        self.conflict_three_minute.dtlookahead_def = 180.0  # Lookahead time [s]
 
         # Scenario info
         self.n_abnormal_acf = 0
 
         with self.settrafarrays():
 
-            self.under_ctrl = np.array([])  # 0 for controlled, 1 for uncontrolled
-            self.radar_vector = np.array([])  # 0 if acf is on own-navigation, 1 if acf is being radar vectored
+            self.under_ctrl = np.array([], dtype=bool)  # Whether acf is under control (in airspace)
+            self.radar_vector = np.array([], dtype=bool)  # Whether acf is being radar vectored or on self-navigation
+                                                            # This will be used to assess whether an acf leaves airspace unexpectly
             self.intention = np.array([])   # 0 for arrival, 1 for departure [deg]
             self.wp_lat = np.array([])      # Latitude of the target waypoint [deg]
             self.wp_lon = np.array([])      # Longitude of the target waypoint [deg]
@@ -74,12 +89,14 @@ class ApproachBS(core.Entity):
             self.out_of_range = np.array([], dtype=bool)    # out-of-range acfs will be deleted if it is a radar take-over aircraft
 
             # Copy attibutes to monitor changes
+            self.prev_acf_id = traf.id.copy()   # Previous aircraft IDs
             self.prev_selspd = traf.selspd.copy()   # Previous selected speed [m/s]
             self.prev_selalt = traf.selalt.copy()   # Previous selected altitude [m]
             self.prev_seltrk = traf.aporasas.trk.copy() # Previous selected track [deg]
             self.prev_under_ctrl = self.under_ctrl.copy()   # Previous under control status
             self.prev_radar_vector = self.radar_vector.copy()   # Previous radar vector status
 
+        # Current area invasion)
 
         # Aircraft generation settings
         self.auto_gen_setting = {
@@ -174,7 +191,35 @@ class ApproachBS(core.Entity):
         self.time_last_cmd[-n:] = -60.0
 
 
-    @core.timed_function(name='appbs_update', dt=0.1)
+    @core.timed_function(name='my_asas_2', dt=0.1)
+    def update(self):
+        ''' This function gets called automatically every 0.1 second. '''
+
+        # Delete excess aircrafts
+        if self.appbs_delete_excess_acfs.__manualtimer__.readynext() and self.tracon.is_active():
+            self.appbs_delete_excess_acfs()
+
+        # Update aircraft status
+        if self.appbs_update.__manualtimer__.readynext() and self.tracon.is_active():
+            self.appbs_update()
+
+        # Delete out-of-range aircrafts
+        if self.appbs_auto_delete_acfs.__manualtimer__.readynext() and self.tracon.is_active():
+            self.appbs_auto_delete_acfs()
+
+        # Update conflict detectors
+        if self.update_conflict_detectors.__manualtimer__.readynext() and self.tracon.is_active():
+            self.update_conflict_detectors()
+
+
+    @core.timed_function(name='my_asas', dt=0.5, manual=True)
+    def update_conflict_detectors(self):
+        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
+        # Check for conflicts in one minute
+        self.conflict_one_minute.update(traf, traf)
+
+
+    @core.timed_function(name='appbs_update', dt=0.1, manual=True)
     def appbs_update(self):
         ''' Periodically update aircraft status. '''
 
@@ -185,24 +230,54 @@ class ApproachBS(core.Entity):
         dist_from_ctr = qdrdist_matrix(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat, traf.lon)[1]
         self.out_of_range[:] = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
 
-        # Take over aircrafts in the TRACON airspace
-        self.take_over[:] = self.take_over | (dist_from_ctr < self.tracon.range & self.tracon.bottom <= traf.alt <= self.tracon.top)
-
         # under_ctrl
-        pass
-        self.under_ctrl[:] = 0
+        self.under_ctrl[:] = (dist_from_ctr < self.tracon.range) & (self.tracon.bottom <= traf.alt <= self.tracon.top)
+
+        # Take over aircrafts in the TRACON airspace
+        self.take_over[:] = self.take_over | self.under_ctrl
+
+        # Radar vector
+        # Do not vector if the aircraft has LNAV on
+        self.radar_vector[traf.swlnav] = False
+        # vector aircrafts that just entered the TRACON airspace
+        self.radar_vector[self.under_ctrl & ~self.prev_under_ctrl] = True
+        # vector in-airspace aircrafts that has LNAV off
+        self.radar_vector[self.under_ctrl & ~traf.swlnav] = True
+
+        # Record enter time
+        self.time_entered = np.where(self.under_ctrl & ~self.prev_under_ctrl, sim.simt, self.time_entered)
+
+        # Check if the aircraft received a command
+        received_cmd = np.zeros_like(traf.id, dtype=bool)
+        for i in range(len(self.prev_acf_id)):
+            if self.prev_acf_id[i] not in traf.id:
+                # Aircraft is deleted
+                continue
+            new_index = traf.id.index(self.prev_acf_id[i])
+            if self.prev_selspd[i] != traf.selspd[new_index] or \
+                self.prev_selalt[i] != traf.selalt[new_index] or \
+                self.prev_seltrk[i] != traf.aporasas.trk[new_index] or \
+                self.prev_radar_vector[i] != self.radar_vector[new_index]:
+                # Aircraft received a command
+                received_cmd[new_index] = True
+        self.time_last_cmd = np.where(received_cmd, sim.simt, self.time_last_cmd)
+
+        # Update previous status
+        self.prev_selspd[:] = traf.selspd
+        self.prev_selalt[:] = traf.selalt
+        self.prev_seltrk[:] = traf.aporasas.trk
+        self.prev_under_ctrl[:] = self.under_ctrl
+        self.prev_radar_vector[:] = self.radar_vector
 
 
-
-
-    @core.timed_function(name='appbs_delete_excess_acfs', dt=0.5)
+    @core.timed_function(name='appbs_delete_excess_acfs', dt=0.5, manual=True)
     def appbs_delete_excess_acfs(self):
         ''' Periodically delete aircrafts if there re more than 50 aircrafts. '''
         while len(traf.id) > 50:
             traf.delete(-1)
 
     
-    @core.timed_function(name='appbs_auto_delete_acfs', dt=0.5)
+    @core.timed_function(name='appbs_auto_delete_acfs', dt=0.5, manual=True)
     def appbs_auto_delete_acfs(self):
         ''' Periodically delete out-of-range aircrafts. '''
         if not self.tracon.active:
@@ -232,12 +307,6 @@ class ApproachBS(core.Entity):
             i += 1
 
 
-    @core.timed_function(name='update_additional_info', dt=0.5)
-    def update_additional_info(self):
-        ''' Periodically update additional attributes defined in this plugin for all aircrafts. '''
-        pass
-
-
     # Stack commands
     @stack.command
     def assign_runway(self, acid: 'acid', runway: str = ""):
@@ -248,6 +317,151 @@ class ApproachBS(core.Entity):
             return True, msg
         return True, f'The assigned waypoint of Aircraft {traf.id[acid]} is set to ({self.wp_lat[acid]}, {self.wp_lon[acid]}).'
     
+
+class MyConflictDetection(ConflictDetection):
+    """
+    Custom conflict detection class for TRACON operations.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.use_global_asas_setting = False
+
+
+    def reset(self):
+        """ 
+        Override the reset function to avoid resetting the global settings. 
+        Does not reset horizontal and vertical minimum separations and lookahead time
+        """
+        core.Entity.reset(self)
+        self.clearconfdb()
+        self.confpairs_all.clear()
+        self.lospairs_all.clear()
+
+
+    @staticmethod
+    def setmethod():
+        """ Override the setmethod function to avoid stack commands handling. """
+        pass
+
+
+    def setrpz(self):
+        """ Override the setrpz function to avoid stack commands handling. """
+        pass
+
+
+    def sethpz(self):
+        """ Override the sethpz function to avoid stack commands handling. """
+        pass
+
+
+    def setdtlook(self):
+        """ Override the setdtlook function to avoid stack commands handling. """
+        pass
+
+
+    def setdtnolook(self):
+        """ Override the setdtnolook function to avoid stack commands handling. """
+        pass
+
+
+    def detect(self, ownship, intruder, rpz, hpz, dtlookahead):
+        ''' State-based conflict detection. Copied from the original code. '''
+        # Identity matrix of order ntraf: avoid ownship-ownship detected conflicts
+        I = np.eye(ownship.ntraf)
+
+        # Horizontal conflict ------------------------------------------------------
+
+        # qdrlst is for [i,j] qdr from i to j, from perception of ADSB and own coordinates
+        qdr, dist = kwikqdrdist_matrix(np.asmatrix(ownship.lat), np.asmatrix(ownship.lon),
+                                    np.asmatrix(intruder.lat), np.asmatrix(intruder.lon))
+
+        # Convert back to array to allow element-wise array multiplications later on
+        # Convert to meters and add large value to own/own pairs
+        qdr = np.asarray(qdr)
+        dist = np.asarray(dist) * nm + 1e9 * I
+
+        # Calculate horizontal closest point of approach (CPA)
+        qdrrad = np.radians(qdr)
+        dx = dist * np.sin(qdrrad)  # is pos j rel to i
+        dy = dist * np.cos(qdrrad)  # is pos j rel to i
+
+        # Ownship track angle and speed
+        owntrkrad = np.radians(ownship.trk)
+        ownu = ownship.gs * np.sin(owntrkrad).reshape((1, ownship.ntraf))  # m/s
+        ownv = ownship.gs * np.cos(owntrkrad).reshape((1, ownship.ntraf))  # m/s
+
+        # Intruder track angle and speed
+        inttrkrad = np.radians(intruder.trk)
+        intu = intruder.gs * np.sin(inttrkrad).reshape((1, ownship.ntraf))  # m/s
+        intv = intruder.gs * np.cos(inttrkrad).reshape((1, ownship.ntraf))  # m/s
+
+        du = ownu - intu.T  # Speed du[i,j] is perceived eastern speed of i to j
+        dv = ownv - intv.T  # Speed dv[i,j] is perceived northern speed of i to j
+
+        dv2 = du * du + dv * dv
+        dv2 = np.where(np.abs(dv2) < 1e-6, 1e-6, dv2)  # limit lower absolute value
+        vrel = np.sqrt(dv2)
+
+        tcpa = -(du * dx + dv * dy) / dv2 + 1e9 * I
+
+        # Calculate distance^2 at CPA (minimum distance^2)
+        dcpa2 = np.abs(dist * dist - tcpa * tcpa * dv2)
+
+        # Check for horizontal conflict
+        # RPZ can differ per aircraft, get the largest value per aircraft pair
+        rpz = np.asarray(np.maximum(np.asmatrix(rpz), np.asmatrix(rpz).transpose()))
+        R2 = rpz * rpz
+        swhorconf = dcpa2 < R2  # conflict or not
+
+        # Calculate times of entering and leaving horizontal conflict
+        dxinhor = np.sqrt(np.maximum(0., R2 - dcpa2))  # half the distance travelled inzide zone
+        dtinhor = dxinhor / vrel
+
+        tinhor = np.where(swhorconf, tcpa - dtinhor, 1e8)  # Set very large if no conf
+        touthor = np.where(swhorconf, tcpa + dtinhor, -1e8)  # set very large if no conf
+
+        # Vertical conflict --------------------------------------------------------
+
+        # Vertical crossing of disk (-dh,+dh)
+        dalt = ownship.alt.reshape((1, ownship.ntraf)) - \
+            intruder.alt.reshape((1, ownship.ntraf)).T  + 1e9 * I
+
+        dvs = ownship.vs.reshape(1, ownship.ntraf) - \
+            intruder.vs.reshape(1, ownship.ntraf).T
+        dvs = np.where(np.abs(dvs) < 1e-6, 1e-6, dvs)  # prevent division by zero
+
+        # Check for passing through each others zone
+        # hPZ can differ per aircraft, get the largest value per aircraft pair
+        hpz = np.asarray(np.maximum(np.asmatrix(hpz), np.asmatrix(hpz).transpose()))
+        tcrosshi = (dalt + hpz) / -dvs
+        tcrosslo = (dalt - hpz) / -dvs
+        tinver = np.minimum(tcrosshi, tcrosslo)
+        toutver = np.maximum(tcrosshi, tcrosslo)
+
+        # Combine vertical and horizontal conflict----------------------------------
+        tinconf = np.maximum(tinver, tinhor)
+        toutconf = np.minimum(toutver, touthor)
+
+        swconfl = np.array(swhorconf * (tinconf <= toutconf) * (toutconf > 0.0) *
+                           np.asarray(tinconf < np.asmatrix(dtlookahead).T) * (1.0 - I), dtype=bool)
+
+        # --------------------------------------------------------------------------
+        # Update conflict lists
+        # --------------------------------------------------------------------------
+        # Ownship conflict flag and max tCPA
+        inconf = np.any(swconfl, 1)
+        tcpamax = np.max(tcpa * swconfl, 1)
+
+        # Select conflicting pairs: each a/c gets their own record
+        confpairs = [(ownship.id[i], ownship.id[j]) for i, j in zip(*np.where(swconfl))]
+        swlos = (dist < rpz) * (np.abs(dalt) < hpz)
+        lospairs = [(ownship.id[i], ownship.id[j]) for i, j in zip(*np.where(swlos))]
+
+        return confpairs, lospairs, inconf, tcpamax, \
+            qdr[swconfl], dist[swconfl], np.sqrt(dcpa2[swconfl]), \
+                tcpa[swconfl], tinconf[swconfl]
+
 
 class Tracon:
     """
@@ -609,6 +823,10 @@ class Tracon:
 
         # Draw the TRACON area
         stack.stack(f"CIRCLE {self.identifier}, {self.ctr_lat}, {self.ctr_lon}, {self.range}")
+        stack.stack(f"COL {self.identifier} GREEN")
+
+        # Turn on aircraft symbol
+        stack.stack("SYMBOL")
 
 
     def _obtain_airport_info(self):
