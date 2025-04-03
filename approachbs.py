@@ -5,12 +5,13 @@ This plugin adds terminal area (TRACON) operations to BlueSky.
 """
 import random
 import numpy as np
+from matplotlib.path import Path
 import bluesky as bs
 from bluesky import core, stack, sim, traf
 from bluesky.traffic.asas import ConflictDetection
 from bluesky.tools.areafilter import basic_shapes, deleteArea, defineArea, checkInside
 from bluesky.tools.aero import ft, nm, kts, fpm
-from bluesky.tools.geo import qdrpos, qdrdist, qdrdist_matrix, kwikqdrdist_matrix
+from bluesky.tools.geo import qdrpos, qdrdist, qdrdist_matrix, kwikqdrdist_matrix, direct
 from bluesky.navdatabase import Navdatabase
 
 # Constants
@@ -79,7 +80,7 @@ class ApproachBS(core.Entity):
             self.wp_alt = np.array([])      # Designated altitude of the target waypoint [ft]
             self.rwy_course = np.array([])  # True heading (magnatic, aka "bearing" in BlueSky) of assigned runway (for arrival acfs) [deg]
             self.dist_to_wp = np.array([])  # Distance to the target waypoint [nm]
-            self.bear_to_wp = np.array([])  # Bearing to the target waypoint [deg]
+            self.bearing_to_wp = np.array([])  # Bearing to the target waypoint [deg]
             self.time_entered = np.array([])    # when aircraft entered the controlled airspace [s]
             self.time_last_cmd = np.array([])   # when aircraft recieved the previous command [s]
 
@@ -88,19 +89,30 @@ class ApproachBS(core.Entity):
                                                         # All aircrafts are not take-over when spawning, until they enter the TRACON airspace.
             self.out_of_range = np.array([], dtype=bool)    # out-of-range acfs will be deleted if it is a radar take-over aircraft
 
-            # Copy attibutes to monitor changes
-            self.prev_acf_id = traf.id.copy()   # Previous aircraft IDs
-            self.prev_selspd = traf.selspd.copy()   # Previous selected speed [m/s]
-            self.prev_selalt = traf.selalt.copy()   # Previous selected altitude [m]
-            self.prev_seltrk = traf.aporasas.trk.copy() # Previous selected track [deg]
-            self.prev_under_ctrl = self.under_ctrl.copy()   # Previous under control status
-            self.prev_radar_vector = self.radar_vector.copy()   # Previous radar vector status
+        # Copy attibutes to monitor changes
+        self.prev_acf_id = traf.id.copy()   # Previous aircraft IDs
+        self.prev_selspd = traf.selspd.copy()   # Previous selected speed [m/s]
+        self.prev_selalt = traf.selalt.copy()   # Previous selected altitude [m]
+        self.prev_seltrk = traf.aporasas.trk.copy() # Previous selected track [deg]
+        self.prev_under_ctrl = self.under_ctrl.copy()   # Previous under control status
+        self.prev_radar_vector = self.radar_vector.copy()   # Previous radar vector status
 
-        # Current area invasion)
+        # Predicted aircraft status
+        self.one_minute_lat = np.array([])  # Latitude of the aircraft in one minute [deg]
+        self.one_minute_lon = np.array([])  # Longitude of the aircraft in one minute [deg]
+        self.one_minute_alt = np.array([])  # Altitude of the aircraft in one minute [m]
+        self.three_minute_lat = np.array([])  # Latitude of the aircraft in three minutes [deg]
+        self.three_minute_lon = np.array([])  # Longitude of the aircraft in three minutes [deg]
+        self.three_minute_alt = np.array([])  # Altitude of the aircraft in three minutes [m]
+
+        # Area invasion
+        self.current_invasion = dict()  # Current area invasion status
+        self.one_minute_invasion = dict()  # One minute area invasion status
+        self.three_minute_invasion = dict()  # Three minute area invasion status
+
 
         # Aircraft generation settings
         self.auto_gen_setting = {
-            "acf_auto_gen": False,  # Whether to automatically generate aircrafts or not
             "dep_gen_rate": 0.0,    # Aircraft generation rate [aircraft/min]
             "arr_gen_rate": 0.0     # Aircraft generation rate [aircraft/min]
         }
@@ -117,81 +129,185 @@ class ApproachBS(core.Entity):
         pass
 
 
-    def my_cre_acf(self, acfinfo: dict) -> None:
+    @stack.command
+    def appbs_cre(self, 
+                  acfid: 'txt',  # type: ignore
+                  acftype: 'txt' = "B737",  # type: ignore
+                  pos: 'latlon' = (361.0, 361.0),  # type: ignore
+                  hdg: 'hdg' = 270,  # type: ignore
+                  alt: 'alt' = 8000 * ft,  # type: ignore
+                  spd: 'spd' = 250 * kts,  # type: ignore
+                  intention: 'txt' = "ARRIVAL", # type: ignore
+                  target_wp_id: 'txt' = "",     # e.g. "KSFO/28L" or "DEP1" # type: ignore
+                  dep_rwy_id: 'txt' = ""):     # type: ignore # e.g. "KSFO/28L"
+        """ 
+        Create an aircraft. Provides stack command APPBS_CRE.
+        This is the preferred method to create an aircraft in ApproachBS in place of CRE.
+        """
+
+        if not self.tracon.is_active():
+            stack.stack(f"ECHO Aircraft {acfid} is not created. The TRACON is not active.")
+            print("Failed to create aircraft. The TRACON is not active.")
+            return False
+        
+        if len(traf.id) >= 50:
+            stack.stack(f"ECHO Aircraft {acfid} is not created. The number of aircrafts has reached the upper limit 50.")
+            print("Failed to create aircraft. The number of aircrafts has reached the upper limit 50.")
+            return False
+        
+        if acfid in traf.id:
+            stack.stack(f"ECHO Aircraft {acfid} already exists.")
+            print(f"Failed to create aircraft. Aircraft {acfid} is already created.")
+            return False
+        
+        lat, lon = pos
+        if lat == 361.0 or lon == 361.0:
+            lat, lon = self.tracon.ctr_lat, self.tracon.ctr_lon + 0.5
+        
+        # If the aircraft is departure, override the altitude, heading, and speed
+        if intention == "DEPARTURE":
+            # If dep_rwy_id is not empty, use the assigned runway to override the position
+            if dep_rwy_id and '/' in dep_rwy_id:
+                dep_apt, dep_rwy = dep_rwy_id.split('/')
+                if dep_apt in self.tracon.dep_rwy_id and dep_rwy in self.tracon.dep_rwy_id[dep_apt]:
+                    lat, lon = self.tracon.rwy_thres[dep_apt][dep_rwy][:2]
+                    alt = self.tracon.rwy_thres[dep_apt][dep_rwy][2] * ft
+                    spd = 0.0
+                    hdg = self.tracon.rwy_thres[dep_apt][dep_rwy][2]
+                else:
+                    stack.stack(f"The assigned departure runway {dep_rwy_id} is not valid. Spawning at {lat}, {lon}.")
+            else:
+                # Take off from the input position
+                alt = self.tracon.elevation
+                spd = 0.0
+        
+        # Create new aircraft using traf.cre
+        traf.cre(acid=acfid,
+                 actype=acftype,
+                 aclat=lat,
+                 aclon=lon,
+                 achdg=hdg,
+                 acalt=alt*ft,
+                 acspd=spd*kts)
+        
+        # Check intention
+        if intention not in ["ARRIVAL", "DEPARTURE"]:
+            stack.stack(f"The intention of {acfid} is not valid. Reset to default (ARRIVAL).")
+            intention = "ARRIVAL"
+
+        # Assign runway if arrival
+        if intention == "ARRIVAL":
+            self.intention[-1] = 0
+            # If target_wp_id is invalid, assign random runway
+            valid_wp = True
+            if not target_wp_id:
+                valid_wp = False
+                stack.stack(f"Assigning random runway.")
+            else:
+                target_apt, target_rwy = target_wp_id.upper().split('/')
+                if target_apt not in self.tracon.apt or target_rwy not in self.tracon.arr_rwy_id[target_apt]:
+                    valid_wp = False
+                    stack.stack(f"The assigned runway {target_wp_id} is not valid. Assigning random runway.")
+            if not valid_wp:
+                # Assign random runway
+                target_apt = random.choice(list(self.tracon.apt.keys()))
+                target_rwy = random.choice(self.tracon.arr_rwy_id[target_apt])
+            # Set target waypoint to the FAP of the assigned runway
+            self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.fap[target_apt][target_rwy]
+            # Set runway course
+            self.rwy_course[-1] = self.tracon.rwy_thres[target_apt][target_rwy][2]
+            stack.stack(f"{acfid}: to land {target_apt}/{target_rwy}.")
+
+        # Assign departure waypoint if departure
+        else:
+            self.intention[-1] = 1
+            # If target_wp_id is invalid, assign random departure waypoint
+            valid_wp = True
+            if not target_wp_id:
+                valid_wp = False
+                stack.stack(f"Assigning random departure waypoint.")
+            elif target_wp_id not in self.tracon.dep_rwy_id:
+                valid_wp = False
+                stack.stack(f"The assigned runway {target_wp_id} is not valid. Assigning random departure waypoint.")
+            if not valid_wp:
+                # Assign random departure waypoint
+                target_wp_id = random.choice(list(self.tracon.dep_rwy_id.keys()))
+            # Set target waypoint to the departure waypoint of the assigned runway
+            self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.depart_wp[target_wp_id]
+            stack.stack(f"{acfid}: to depart {target_wp_id}.")
+            # Take-off clearance
+            stack.stack(f"ALT {acfid} {self.tracon.bottom + 1000}; SPD {acfid} 180")
+
+        return True
+
+
+    def cre_acf_from_dict(self, acfinfo: dict) -> None:
         """
         Create an aircraft
         Parameter acfinfo can be found in aircraft.py
         """
 
-        if len(traf.id) >= 50:
-            print("Failed to create aircraft. The number of aircrafts has reached the upper limit 50.")
-            return
-        
-        if not self.tracon.active:
-            print("Failed to create aircraft. Load a valid TRACON scenario first.")
-        
-        # Create new aircraft using traf.cre
-        traf.cre(acid=acfinfo['callsign'],
-                 actype=acfinfo['acf_type'],
-                 aclat=acfinfo['lat'],
-                 aclon=acfinfo['lon'],
-                 achdg=acfinfo['curr_trk'],
-                 acalt=acfinfo['curr_alt']*ft,
-                 acspd=acfinfo['curr_cas']*kts)
-        
-        # Change altitude if target_alt neq curr_alt
-        if acfinfo['target_alt'] != acfinfo['curr_alt']:
-            stack.stack(f"ALT {acfinfo['callsign']} {acfinfo['target_alt']}")
-            traf.vs[-1] = acfinfo['curr_vs'] * fpm
-            self.target_alt[-1] = acfinfo['target_alt'] * ft
-
-        # Change airspeed if target_cas neq curr_cas
-        if acfinfo['target_cas'] != acfinfo['curr_cas']:
-            stack.stack(f"SPD {acfinfo['callsign']} {acfinfo['target_cas']}")
-            self.target_cas[-1] = acfinfo['target_cas'] * kts
-        
-        # Change track if target_trk neq curr_trk
-        if acfinfo['target_trk'] != acfinfo['curr_trk']:
-            stack.stack(f"HDG {acfinfo['callsign']} {acfinfo['target_trk']}")
-            self.target_trk[-1] = acfinfo['target_trk']
-        
-        # Set aircraft to inactive
-        self.take_over[-1] = False
-
-        self.intention[-1] = 0 if acfinfo['intention'] == "arrival" else 1
-        self.wp_lat[-1] = acfinfo['target_wp_lat']
-        self.wp_lon[-1] = acfinfo['target_wp_lon']
-        self.wp_alt[-1] = acfinfo['target_wp_alt']
-        self.rwy_course[-1] = acfinfo['target_rwy_crs']
-
-        pass
+        self.appbs_cre(acfid=acfinfo['callsign'].upper(),
+                       acftype=acfinfo['acf_type'].upper(),
+                       pos=(acfinfo['lat'], acfinfo['lon']),
+                       hdg=acfinfo['trk'],
+                       alt=acfinfo['alt'] * ft,
+                       spd=acfinfo['cas'] * kts,
+                       intention=acfinfo['intention'],
+                       target_wp_id=acfinfo['target_wp_id'].upper(),
+                       dep_rwy_id=acfinfo['dep_rwy_id'.upper()])
 
 
     def create(self, n=1):
         ''' This function gets called automatically when new aircraft are created. '''
         super().create(n)
         # Initialize attributes
-        self.target_alt[-n:] = traf.alt[-n:]
-        self.target_vs[-n:] = traf.alt[-n:]
-        self.target_cas[-n:] = traf.cas[-n:]
-        self.target_trk[-n:] = traf.trk[-n:]
+        self.under_ctrl[-n:] = False
+        self.radar_vector[-n:] = False
 
-        self.under_ctrl[-n:] = 0
-        self.radar_vector[-n:] = 1.0
-
-        self.take_over[-n:] = True
+        self.take_over[-n:] = False
         self.out_of_range[-n:] = False
         
-        self.intention[-n:] = 0
-        self.wp_lat[-n:] = -1000.0
-        self.wp_lon[-n:] = -1000.0
+        self.intention[-n:] = -1
+        self.wp_lat[-n:] = 361.0
+        self.wp_lon[-n:] = 361.0
         self.wp_alt[-n:] = -1000.0
-        self.rwy_course[-n:] = 0.0
+        self.rwy_course[-n:] = 361.0
+        self.dist_to_wp[-n:] = -1.0
+        self.bearing_to_wp[-n:] = 361.0
         self.time_entered[-n:] = -60.0
         self.time_last_cmd[-n:] = -60.0
 
 
-    @core.timed_function(name='my_asas_2', dt=0.1)
+    def update_invasion(self, lat, lon, alt):
+        """ 
+        Check area invasion based on input coordinates. 
+        Return a dictionary mapping aircraft IDs to a list of area IDs.
+        """
+        new_invasion = dict()
+
+        # No restricted area or no aircrafts
+        if traf.ntraf == 0 or not self.tracon.restrict:
+            return new_invasion
+        
+        # Check lengths
+        assert len(lat) == len(lon) == len(alt) == len(traf.ntraf), \
+            "Length of lat, lon, and alt must be equal to the number of aircrafts."
+        
+        # Iterate through areas
+        for area_id in self.tracon.restrict:
+            inside_flag = checkInside(area_id, lat, lon, alt / ft)
+            # Update the dictionary
+            for idx, inside in enumerate(inside_flag):
+                if inside:
+                    if traf.id[idx] not in new_invasion:
+                        new_invasion[traf.id[idx]] = []
+                    new_invasion[traf.id[idx]].append(area_id)
+        
+        return new_invasion
+
+
+    @core.timed_function(name='appbs_update_manager', dt=0.1)
     def update(self):
         ''' This function gets called automatically every 0.1 second. '''
 
@@ -211,12 +327,21 @@ class ApproachBS(core.Entity):
         if self.update_conflict_detectors.__manualtimer__.readynext() and self.tracon.is_active():
             self.update_conflict_detectors()
 
+        # Update predicted aircraft positions for invasion prediction
+        if self.appbs_predict.__manualtimer__.readynext() and self.tracon.is_active():
+            self.appbs_predict()
 
-    @core.timed_function(name='my_asas', dt=0.5, manual=True)
-    def update_conflict_detectors(self):
-        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
-        # Check for conflicts in one minute
-        self.conflict_one_minute.update(traf, traf)
+        # Update area invasion status and predicted invasion
+        if self.update_invasions.__manualtimer__.readynext() and self.tracon.is_active():
+            self.update_invasions()
+
+        # Generate departure aircrafts
+        if self.generate_dep_acf.__manualtimer__.readynext() and self.tracon.is_active() and self.auto_gen_setting['dep_gen_rate'] > 0.0:
+            self.generate_dep_acf()
+
+        # Generate arrival aircrafts
+        if self.generate_arr_acf.__manualtimer__.readynext() and self.tracon.is_active() and self.auto_gen_setting['arr_gen_rate'] > 0.0:
+            self.generate_arr_acf()
 
 
     @core.timed_function(name='appbs_update', dt=0.1, manual=True)
@@ -228,13 +353,13 @@ class ApproachBS(core.Entity):
         
         # Check if the aircraft is out of range
         dist_from_ctr = qdrdist_matrix(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat, traf.lon)[1]
-        self.out_of_range[:] = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
+        self.out_of_range = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
 
         # under_ctrl
-        self.under_ctrl[:] = (dist_from_ctr < self.tracon.range) & (self.tracon.bottom <= traf.alt <= self.tracon.top)
+        self.under_ctrl = (dist_from_ctr < self.tracon.range) & (self.tracon.bottom <= traf.alt <= self.tracon.top)
 
         # Take over aircrafts in the TRACON airspace
-        self.take_over[:] = self.take_over | self.under_ctrl
+        self.take_over = self.take_over | self.under_ctrl
 
         # Radar vector
         # Do not vector if the aircraft has LNAV on
@@ -263,11 +388,31 @@ class ApproachBS(core.Entity):
         self.time_last_cmd = np.where(received_cmd, sim.simt, self.time_last_cmd)
 
         # Update previous status
-        self.prev_selspd[:] = traf.selspd
-        self.prev_selalt[:] = traf.selalt
-        self.prev_seltrk[:] = traf.aporasas.trk
-        self.prev_under_ctrl[:] = self.under_ctrl
-        self.prev_radar_vector[:] = self.radar_vector
+        self.prev_selspd = traf.selspd.copy()
+        self.prev_selalt = traf.selalt.copy()
+        self.prev_seltrk = traf.aporasas.trk.copy()
+        self.prev_under_ctrl = self.under_ctrl.copy()
+        self.prev_radar_vector = self.radar_vector.copy()
+
+
+    @core.timed_function(name='appbs_predict', dt=0.1, manual=True)
+    def appbs_predict(self):
+        """ 
+        Predict the aircraft status in one minute and three minutes. 
+        State-based prediction (same logic as the conflict detection).
+        """
+        if not self.tracon.active:
+            return
+        
+        # Vertical prediction
+        self.one_minute_alt = traf.alt + traf.vs * 60.0
+        self.three_minute_alt = traf.alt + traf.vs * 180.0
+
+        # Horizontal prediction
+        one_minute_dist = traf.gs * 60.0
+        self.one_mniute_lat, self.one_minute_lon = qdrpos(traf.lat, traf.lon, traf.trk, one_minute_dist)
+        three_minute_dist = traf.gs * 180.0
+        self.three_minute_lat, self.three_minute_lon = qdrpos(traf.lat, traf.lon, traf.trk, three_minute_dist)
 
 
     @core.timed_function(name='appbs_delete_excess_acfs', dt=0.5, manual=True)
@@ -307,9 +452,110 @@ class ApproachBS(core.Entity):
             i += 1
 
 
-    # Stack commands
+    @core.timed_function(name='appbs_conflict', dt=0.5, manual=True)
+    def update_conflict_detectors(self):
+        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
+        # Check for conflicts in one minute
+        self.conflict_one_minute.update(traf, traf)
+
+
+    @core.timed_function(name='appbs_invasion', dt=0.5, manual=True)
+    def update_invasions(self):
+        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
+        # Update area invasion status
+        self.current_invasion = self.update_invasion(traf.lat, traf.lon, traf.alt)
+        self.one_minute_invasion = self.update_invasion(self.one_minute_lat, self.one_minute_lon, self.one_minute_alt)
+        self.three_minute_invasion = self.update_invasion(self.three_minute_lat, self.three_minute_lon, self.three_minute_alt)
+
+
+    @core.timed_function(name='appbs_gen_dep_acf', dt=0.5, manual=True)
+    def generate_dep_acf(self):
+        ''' Periodically generate departure aircrafts based on generation settings. '''
+        if not self.tracon.is_active() or self.auto_gen_setting['dep_gen_rate'] <= 0.0:
+            return
+        
+        gen_separation = 60.0 / self.auto_gen_setting['dep_gen_rate']  # [s]
+        time_diff = sim.simt - self.last_dep_gen_time
+        # Use Gaussian distribution to decide when to generate the next aircraft
+        excess_time = time_diff - gen_separation
+        distribution = random.gauss(0, gen_separation / 10)
+        if excess_time > distribution:
+            # Generate a departure aircraft
+            # Choose a random departure runway
+            apt = random.choice(list(self.tracon.dep_rwy_id.keys()))
+            rwy = random.choice(self.tracon.dep_rwy_id[apt])
+            # Choose a random departure waypoint
+            waypoint = random.choice(list(self.tracon.depart_wp.keys()))
+            # Generate a random aircraft ID
+            acfid = "DEP"
+            for i in range(1, 51):
+                if f"{acfid}{i:04}" not in traf.id:
+                    acfid = f"{acfid}{i:04}"
+                    break
+            # Use default aircraft type B737
+            self.appbs_cre(acfid=acfid,
+                           acftype="B737",
+                           intention="DEPARTURE",
+                           target_wp_id=waypoint,
+                           dep_rwy_id=f"{apt}/{rwy}")
+            # Update the last generation time
+            self.last_dep_gen_time = sim.simt
+        
+
+    @core.timed_function(name='appbs_gen_arr_acf', dt=0.5, manual=True)
+    def generate_arr_acf(self):
+        ''' Periodically generate arrival aircrafts based on generation settings. '''
+        if not self.tracon.is_active() or self.auto_gen_setting['arr_gen_rate'] <= 0.0:
+            return
+        
+        gen_separation = 60.0 / self.auto_gen_setting['arr_gen_rate']
+        time_diff = sim.simt - self.last_arr_gen_time
+        # Use Gaussian distribution to decide when to generate the next aircraft
+        excess_time = time_diff - gen_separation
+        distribution = random.gauss(0, gen_separation / 10)
+        if excess_time > distribution:
+            # Generate an arrival aircraft
+            # Determaine the approach direction and altitude
+            count = 0
+            while True:
+                # Choose a direction from the center of the TRACON
+                direction = random.random() * 360.0
+                # Get the vertical envolope from this direction
+                min_alt, max_alt = self.tracon.get_vertical_envelope(direction)
+                # Cannot approach from this direction if the altitude is too low
+                if max_alt <= self.tracon.top - 1100 or min_alt >= self.tracon.top - 900:
+                    alt = self.tracon.top - 1000
+                    break
+                # If the altitude is too low, try again
+                count += 1
+                if count > 20:
+                    alt = self.tracon.top - 1000
+                    break
+            # Get the position of the aircraft
+            lat, lon = qdrpos(self.tracon.ctr_lat, self.tracon.ctr_lon, direction, self.tracon.range + 5.0)
+            # Choose a random arrival runway
+            apt = random.choice(list(self.tracon.arr_rwy_id.keys()))
+            rwy = random.choice(self.tracon.arr_rwy_id[apt])
+            # Generate a random aircraft ID
+            acfid = "ARR"
+            for i in range(1, 51):
+                if f"{acfid}{i:04}" not in traf.id:
+                    acfid = f"{acfid}{i:04}"
+                    break
+            # Use default aircraft type B737
+            # Always flying towards the center of the TRACON
+            self.appbs_cre(acfid=acfid,
+                           acftype="B737",
+                           pos=(lat, lon),
+                           hdg=(direction + 180) % 360,
+                           alt=alt * ft,
+                           spd=250 * kts,
+                           intention="ARRIVAL",
+                           target_wp_id=f"{apt}/{rwy}")
+
+
     @stack.command
-    def assign_runway(self, acid: 'acid', runway: str = ""):
+    def assign_runway(self, acid: 'acid', runway: str = ""): # type: ignore
         ''' Assign the runway to aircraft or return the assigned waypoint. '''
         if not runway:
             msg = f'Aircraft {traf.id[acid]} is not assigned with a waypoint. ' if self.wp_alt[acid] == -1000.0 \
@@ -527,6 +773,10 @@ class Tracon:
         # Extract airport information from the database
         self._obtain_airport_info()
 
+        # Set elevation to the lowest elevation of the airports in the TRACON
+        if self.apt:
+            self.elevation = np.min([self.apt[apt][2] for apt in self.apt])
+
         # Add departure runways
         self.dep_rwy_id = dict()
         if dep_rwy_id is not None:
@@ -559,11 +809,6 @@ class Tracon:
     def activate_tracon(self):
         """ Activate the TRACON if it is qualified. """
 
-        # Load airports, runways, FAPs information from the database
-        if not self._obtain_airport_info():
-            print(f"Warning: Failed to load information from database for at least one airport. TRACON will not be activated.")
-            return False
-
         if not self.identifier:
             print("Warning: TRACON identifier is not set. TRACON will not be activated.")
             return False
@@ -573,15 +818,18 @@ class Tracon:
             return False
 
         if self.range < 10 or self.range > 100:
-            print("Warning: TRACON range is not valid ([10, 100] in NM). TRACON will not be activated.")
+            print("Warning: TRACON range is not valid (needs to be in [10, 100] in NM). TRACON will not be activated.")
             return False
 
         if self.top < 3000 or self.top > 18000:
-            print("Warning: TRACON top altitude is not valid ([3000, 18000] in ft). TRACON will not be activated.")
+            print("Warning: TRACON top altitude is not valid (needs to be in [3000, 18000] in ft). TRACON will not be activated.")
             return False
+        
+        if self.top - self.elevation < 5000:
+            print("Warning: Vertical space is not enough (need at least 5000 ft). TRACON will not be activated.")
 
-        if self.bottom < DELETE_BELOW or self.bottom > self.top - 1000:
-            print(f"Warning: TRACON bottom altitude is not valid ([{DELETE_BELOW}, top altitude - 1000] in ft). TRACON will not be activated.")
+        if self.bottom < DELETE_BELOW:
+            print(f"Warning: TRACON bottom altitude is less than {DELETE_BELOW}. TRACON will not be activated.")
             return False
 
         if not self.apt:
@@ -593,16 +841,17 @@ class Tracon:
                 return False
             
         if not self.dep_rwy_id:
-            print("Warning: TRACON does not have any open runways. TRACON will not be activated.")
+            print("Warning: TRACON does not have any open runways for departure. TRACON will not be activated.")
             return False
         if not self.arr_rwy_id:
-            print("Warning: TRACON does not have any open runways. TRACON will not be activated.")
+            print("Warning: TRACON does not have any open runways for arrival. TRACON will not be activated.")
             return False
         if not self.depart_wp:
             print("Warning: TRACON does not have any departure waypoints. TRACON will not be activated.")
             return False
             
         self._active = True
+        stack.stack("ECHO Airspace is activated.")
         print(f"TRACON {self.identifier} is activated.")
         return True
 
@@ -656,9 +905,13 @@ class Tracon:
         
         # Add the restricted area
         self.restrict[args[0]] = np.array(args[1:], dtype=float)
-
-        # Draw the restricted area
-        # Later
+        # Add the restricted area to simulator. It will be drawn in the GUI automatically.
+        if args[1] == 0:
+            # Circle
+            defineArea(args[0].upper(), "CIRCLE", [args[4], args[5], args[6]], args[3], args[2])
+        elif args[1] == 1:
+            # Polygon
+            defineArea(args[0].upper(), "POLYGON", args[4:], args[3], args[2])
 
         return True
 
@@ -675,6 +928,9 @@ class Tracon:
             print("Error: Cannot remove restricted area from an active TRACON.")
 
         if area_id in self.restrict:
+            if area_id.upper() in basic_shapes:
+                # Remove the area from the simulator
+                deleteArea(area_id.upper())
             del self.restrict[area_id]
             print(f"Restricted area {area_id} removed.")
             return True
@@ -808,6 +1064,40 @@ class Tracon:
         else:
             print(f"Error: Departure waypoint {wp_id} does not exist.")
             return False
+
+
+    def get_vertical_envolope(self, bearing):
+        """
+        Get the vertical restrictions from the center with a given bearing.
+        When generating arbitrary arriving traffic, the vertical envelope is used to 
+         determine the altitude of the aircraft based on its bearing from the TRACON center.
+        return: min_alt, max_alt (ft)
+        """
+
+        min_alt = float('inf')
+        max_alt = float('-inf')
+
+        # Ray endpoint
+        end_lat, end_lon = qdrpos(self.ctr_lat, self.ctr_lon, bearing, self.range + 10)
+        # Ray
+        ray = np.array([[self.ctr_lat, self.ctr_lon], [end_lat, end_lon]])
+
+        for area_id in self.restrict:
+            try:
+                shape_path = basic_shapes[area_id].border # Get the shape path of the area
+            except KeyError:
+                print(f"Error: Restricted area {area_id} does not exist in simulator.")
+                continue
+            if shape_path is None:
+                print(f"Error: Restricted area {area_id} does not exist in simulator.")
+                continue
+            # use matplotlib to check if the ray intersects with the polygon
+            ray_path = Path(ray)
+            if shape_path.intersects(ray_path):
+                min_alt = min(min_alt, basic_shapes[area_id].bottom)
+                max_alt = max(max_alt, basic_shapes[area_id].top)
+
+        return min_alt, max_alt
 
 
     def _gui_draw(self):
