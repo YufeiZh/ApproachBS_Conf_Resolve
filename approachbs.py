@@ -43,6 +43,12 @@ def init_plugin():
             'txt,txt,latlon,[hdg,alt,spd,txt,latlon]',
             approach_bs.appbs_cre,
             'Create an aircraft.'
+        ],
+        'APPBS_ACTIVATE': [
+            'APPBS_ACTIVATE',
+            '',
+            approach_bs.appbs_activate,
+            'Activate the TRACON.'
         ]
     }
     
@@ -99,10 +105,12 @@ class ApproachBS(core.Entity):
             self.out_of_range = np.array([], dtype=bool)    # out-of-range acfs will be deleted if it is a radar take-over aircraft
 
         # Copy attibutes to monitor changes
+        # To monitor whether aircraft received a command
         self.prev_acf_id = traf.id.copy()   # Previous aircraft IDs
         self.prev_selspd = traf.selspd.copy()   # Previous selected speed [m/s]
         self.prev_selalt = traf.selalt.copy()   # Previous selected altitude [m]
         self.prev_seltrk = traf.aporasas.trk.copy() # Previous selected track [deg]
+        # To monitor entering/leaving the airspace and vectoring status
         self.prev_under_ctrl = self.under_ctrl.copy()   # Previous under control status
         self.prev_radar_vector = self.radar_vector.copy()   # Previous radar vector status
 
@@ -128,7 +136,7 @@ class ApproachBS(core.Entity):
         self.last_dep_gen_time = 0.0  # Last generation time for departure aircrafts [s]
         self.last_arr_gen_time = 0.0  # Last generation time for arrival aircrafts [s]
         
-        # Other Timers
+        # Timers
         self.update_timer = core.Timer(name='appbs_update', dt=0.1)
         self.confinvasion_timer = core.Timer(name='appbs_invasion', dt=0.5)
         self.deletion_timer = core.Timer(name='appbs_auto_delete_acfs', dt=0.5)
@@ -179,7 +187,7 @@ class ApproachBS(core.Entity):
         if intention == "DEPARTURE":
             # Parse the position
             if lat == 361.0 or lon == 361.0:
-                stack.stack(f"ECHO Aircraft position is not specified. Using random position.")
+                stack.stack(f"ECHO Aircraft position is not specified. Using random runway.")
                 # Choose a random airport and runway for take-off
                 apt = random.choice(list(self.tracon.dep_rwy_id.keys()))
                 rwy = random.choice(self.tracon.dep_rwy_id[apt])
@@ -199,8 +207,8 @@ class ApproachBS(core.Entity):
                             min_dist = dist
                             min_apt = apt
                             min_rwy = rwy
-                if min_dist >= 0.5:
-                    stack.stack(f"ECHO Aircraft position is not specified. Using the closest runway.")
+                if min_dist >= 1.0:
+                    stack.stack(f"ECHO Aircraft position is not a valid runway. Using the closest runway.")
                 lat, lon = rwy_lat, rwy_lon
                 hdg = self.tracon.rwy_thres[min_apt][min_rwy][2]
                 alt = self.tracon.apt[min_apt][2]
@@ -215,11 +223,11 @@ class ApproachBS(core.Entity):
                 min_dist, target_wp_id = float('inf'), None
                 for wp_id in self.tracon.depart_wp:
                     wp_lat, wp_lon = self.tracon.depart_wp[wp_id][:2]
-                    dist = qdrdist(lat, lon, wp_lat, wp_lon)[1]
+                    dist = qdrdist(target_lat, target_lon, wp_lat, wp_lon)[1]
                     if dist < min_dist:
                         min_dist = dist
                         target_wp_id = wp_id
-                if min_dist >= 1.0:
+                if min_dist >= 2.0:
                     stack.stack(f"ECHO Aircraft target waypoint is not valid. Using the closest departure waypoint.")
 
         # Arrival aircraft
@@ -241,7 +249,7 @@ class ApproachBS(core.Entity):
                 spd = 250.0 * kts
             else:
                 if not hdg:
-                    hdg = qdrdist(lat, lon, self.tracon.ctr_lat, self.tracon.ctr_lon)[1]
+                    hdg = qdrdist(lat, lon, self.tracon.ctr_lat, self.tracon.ctr_lon)[0]
                 if alt < self.tracon.elevation:
                     alt = self.tracon.elevation + 3000.0
                 if spd < 180.0 * kts:
@@ -303,19 +311,20 @@ class ApproachBS(core.Entity):
 
         self.appbs_cre(acfid=acfinfo['callsign'].upper(),
                        acftype=acfinfo['acf_type'].upper(),
-                       pos=(acfinfo['lat'], acfinfo['lon']),
+                       lat=acfinfo['lat'], 
+                       lon=acfinfo['lon'],
                        hdg=acfinfo['trk'],
                        alt=acfinfo['alt'] * ft,
                        spd=acfinfo['cas'] * kts,
                        intention=acfinfo['intention'],
-                       target_wp_id=acfinfo['target_wp_id'].upper(),
-                       dep_rwy_id=acfinfo['dep_rwy_id'.upper()])
+                       target_lat=acfinfo['target_lat'],
+                       target_lon=acfinfo['target_lon'])
 
 
     def create(self, n=1):
-        ''' This function gets called automatically when new aircraft are created. '''
+        ''' This function gets called automatically when new aircrafts are created. '''
         super().create(n)
-        # Initialize attributes
+        # Initialize additional attributes
         self.under_ctrl[-n:] = False
         self.radar_vector[-n:] = False
 
@@ -333,34 +342,6 @@ class ApproachBS(core.Entity):
         self.time_last_cmd[-n:] = -60.0
 
 
-    def update_invasion(self, lat, lon, alt):
-        """ 
-        Check area invasion based on input coordinates. 
-        Return a dictionary mapping aircraft IDs to a list of area IDs.
-        """
-        new_invasion = dict()
-
-        # No restricted area or no aircrafts
-        if traf.ntraf == 0 or not self.tracon.restrict:
-            return new_invasion
-        
-        # Check lengths
-        assert len(lat) == len(lon) == len(alt) == traf.ntraf, \
-            "Length of lat, lon, and alt must be equal to the number of aircrafts."
-        
-        # Iterate through areas
-        for area_id in self.tracon.restrict:
-            inside_flag = checkInside(area_id, lat, lon, alt / ft)
-            # Update the dictionary
-            for idx, inside in enumerate(inside_flag):
-                if inside:
-                    if traf.id[idx] not in new_invasion:
-                        new_invasion[traf.id[idx]] = []
-                    new_invasion[traf.id[idx]].append(area_id)
-        
-        return new_invasion
-
-
     @core.timed_function(name='appbs_update_manager', dt=0.1)
     def update(self):
         ''' This function gets called automatically every 0.1 second. '''
@@ -376,17 +357,11 @@ class ApproachBS(core.Entity):
         # Update aircraft status
         if self.update_timer.readynext() and self.tracon.is_active():
             self.appbs_update()
-
-        # Update conflict detectors
-        if self.update_timer.readynext() and self.tracon.is_active():
-            self.update_conflict_detectors()
-
-        # Update predicted aircraft positions for invasion prediction
-        if self.confinvasion_timer.readynext() and self.tracon.is_active():
             self.appbs_predict()
 
-        # Update area invasion status and predicted invasion
+        # Update conflict detectors
         if self.confinvasion_timer.readynext() and self.tracon.is_active():
+            self.update_conflict_detectors()
             self.update_invasions()
 
         # Generate departure aircrafts
@@ -408,12 +383,12 @@ class ApproachBS(core.Entity):
         if not self.tracon.is_active():
             return
         
-        # Check if the aircraft is out of range
+        # out of range
         dist_from_ctr = qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat, traf.lon)[1]
         self.out_of_range = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
 
         # under_ctrl
-        self.under_ctrl = (dist_from_ctr < self.tracon.range) & (self.tracon.bottom <= traf.alt <= self.tracon.top)
+        self.under_ctrl = (dist_from_ctr < self.tracon.range) & (traf.alt >= self.tracon.bottom) & (traf.alt <= self.tracon.top)
 
         # Take over aircrafts in the TRACON airspace
         self.take_over = self.take_over | self.under_ctrl
@@ -421,13 +396,18 @@ class ApproachBS(core.Entity):
         # Radar vector
         # Do not vector if the aircraft has LNAV on
         self.radar_vector[traf.swlnav] = False
-        # vector aircrafts that just entered the TRACON airspace
-        self.radar_vector[self.under_ctrl & ~self.prev_under_ctrl] = True
         # vector in-airspace aircrafts that has LNAV off
         self.radar_vector[self.under_ctrl & ~traf.swlnav] = True
 
-        # Record enter time
-        self.time_entered = np.where(self.under_ctrl & ~self.prev_under_ctrl, sim.simt, self.time_entered)
+        # Handle aircrafts that just entered or left the TRACON airspace
+        for i in range(len(self.prev_acf_id)):
+            if self.prev_acf_id[i] in traf.id:
+                new_index = traf.id.index(self.prev_acf_id[i])
+                if not self.prev_under_ctrl[i] and self.under_ctrl[new_index]:
+                    # Aircraft just entered the TRACON airspace
+                    traf.swlnav[new_index] = False  # Turn off LNAV
+                    self.radar_vector[new_index] = True # Vectoring
+                    self.time_entered[new_index] = sim.simt  # Record the entering time
 
         # Check if the aircraft received a command
         received_cmd = np.zeros_like(traf.id, dtype=bool)
@@ -437,14 +417,16 @@ class ApproachBS(core.Entity):
                 continue
             new_index = traf.id.index(self.prev_acf_id[i])
             if self.prev_selspd[i] != traf.selspd[new_index] or \
-                self.prev_selalt[i] != traf.selalt[new_index] or \
-                self.prev_seltrk[i] != traf.aporasas.trk[new_index] or \
-                self.prev_radar_vector[i] != self.radar_vector[new_index]:
+               self.prev_selalt[i] != traf.selalt[new_index] or \
+               self.prev_seltrk[i] != traf.aporasas.trk[new_index] or \
+               self.prev_radar_vector[i] != self.radar_vector[new_index]:
                 # Aircraft received a command
                 received_cmd[new_index] = True
+        # Record the time
         self.time_last_cmd = np.where(received_cmd, sim.simt, self.time_last_cmd)
 
         # Update previous status
+        self.prev_acf_id = traf.id.copy()
         self.prev_selspd = traf.selspd.copy()
         self.prev_selalt = traf.selalt.copy()
         self.prev_seltrk = traf.aporasas.trk.copy()
@@ -452,9 +434,47 @@ class ApproachBS(core.Entity):
         self.prev_radar_vector = self.radar_vector.copy()
 
 
+    def appbs_delete_excess_acfs(self):
+        ''' Periodically delete aircrafts if there re more than 50 aircrafts. '''
+        delete_id = []
+        while len(traf.id) > 50:
+            delete_id.append(traf.id[-1])
+            traf.delete(-1)
+        stack.stack(f"ECHO Aircrafts {delete_id} are deleted due to excess number of aircrafts (50).")
+
+    
+    def appbs_auto_delete_acfs(self):
+        ''' Periodically delete out-of-range aircrafts. '''
+        if not self.tracon.is_active():
+            return
+        i = 0
+        while i < len(traf.id):
+            if self.take_over[i] and self.out_of_range[i]:
+                stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
+                traf.delete(i)
+                i -= 1
+            elif self.mode == 'default':
+                if qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[i], traf.lon[i])[1] > self.tracon.range + 20:
+                    # Force deleting aircrafts too far away from the TRACON
+                    stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
+                    traf.delete(i)
+                    i -= 1
+            i += 1
+
+
+    def update_conflict_detectors(self):
+        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
+        # Check for conflicts in one minute
+        self.conflict_one_minute.update(traf, traf)
+        # Check for conflicts in three minutes
+        self.conflict_three_minute.update(traf, traf)
+
+
     def appbs_predict(self):
         """ 
         Predict the aircraft status in one minute and three minutes. 
+        Update the following attributes:
+         one_minute_lat, one_minute_lon, one_minute_alt, three_minute_lat, three_minute_lon, three_minute_alt
         State-based prediction (same logic as the conflict detection).
         """
         if not self.tracon.is_active():
@@ -471,53 +491,38 @@ class ApproachBS(core.Entity):
         self.three_minute_lat, self.three_minute_lon = qdrpos(traf.lat, traf.lon, traf.trk, three_minute_dist)
 
 
-    def appbs_delete_excess_acfs(self):
-        ''' Periodically delete aircrafts if there re more than 50 aircrafts. '''
-        while len(traf.id) > 50:
-            traf.delete(-1)
-
-    
-    def appbs_auto_delete_acfs(self):
-        ''' Periodically delete out-of-range aircrafts. '''
-        if not self.tracon.is_active():
-            return
-        i = 0
-        while i < len(traf.id):
-            if self.take_over[i] and self.out_of_range[i]:
-                if self.intention[i] == 0 and traf.alt[i] < DELETE_BELOW:
-                    # Arrival aircraft landing
-                    stack.stack(f"ECHO Arrival aircraft {traf.id[i]} is deleted.")
-                elif self.intention[i] == 1 \
-                    and qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[i], traf.lon[i])[1] \
-                        > self.tracon.range + DELETE_DISTANCE:
-                    # Departure aircraft leaving the airspace
-                    stack.stack(f"ECHO Departure aircraft {traf.id[i]} is deleted.")
-                else:
-                    # Abnormal deletion
-                    stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
-                traf.delete(i)
-                i -= 1
-            elif self.mode == 'default':
-                if qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[i], traf.lon[i])[1] > self.tracon.range + 50:
-                    # Force deleting aircrafts too far away from the TRACON
-                    stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
-                    traf.delete(i)
-                    i -= 1
-            i += 1
-
-
-    def update_conflict_detectors(self):
-        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
-        # Check for conflicts in one minute
-        self.conflict_one_minute.update(traf, traf)
-
-
     def update_invasions(self):
         ''' This function gets called automatically every 0.5 second if the airspace is active. '''
         # Update area invasion status
-        self.current_invasion = self.update_invasion(traf.lat, traf.lon, traf.alt)
-        self.one_minute_invasion = self.update_invasion(self.one_minute_lat, self.one_minute_lon, self.one_minute_alt)
-        self.three_minute_invasion = self.update_invasion(self.three_minute_lat, self.three_minute_lon, self.three_minute_alt)
+        self.current_invasion = self.predict_invasion(traf.lat, traf.lon, traf.alt)
+        self.one_minute_invasion = self.predict_invasion(self.one_minute_lat, self.one_minute_lon, self.one_minute_alt)
+        self.three_minute_invasion = self.predict_invasion(self.three_minute_lat, self.three_minute_lon, self.three_minute_alt)
+
+
+    def predict_invasion(self, lat, lon, alt):
+        """ 
+        Check area invasion based on input coordinates. 
+        Return a dictionary mapping aircraft IDs to a list of invaded area IDs.
+        """
+        new_invasion = dict()
+
+        # No restricted area or no aircrafts
+        if traf.ntraf == 0 or \
+            not self.tracon.restrict or \
+            not len(lat) == len(lon) == len(alt) == traf.ntraf:
+            return new_invasion
+        
+        # Iterate through areas
+        for area_id in self.tracon.restrict:
+            inside_flag = checkInside(area_id, lat, lon, alt / ft)
+            # Update the dictionary
+            for idx, inside in enumerate(inside_flag):
+                if inside:
+                    if traf.id[idx] not in new_invasion:
+                        new_invasion[traf.id[idx]] = []
+                    new_invasion[traf.id[idx]].append(area_id)
+        
+        return new_invasion
 
 
     def generate_dep_acf(self):
@@ -632,7 +637,6 @@ class ApproachBS(core.Entity):
         stack.stack(f"ECHO Aircrafts without intention are set to Departure. Target waypoint: {depart_wp}.")
 
 
-    @stack.command
     def appbs_activate(self):
         """ Activate the TRACON. """
         if self.tracon.is_active():
@@ -945,8 +949,8 @@ class Tracon:
             msg = "Warning: Vertical space is not enough (need at least 5000 ft). TRACON will not be activated."
             return False, msg
 
-        if self.bottom < DELETE_BELOW:
-            msg = f"Warning: TRACON bottom altitude is less than {DELETE_BELOW}. TRACON will not be activated."
+        if self.bottom < DELETE_BELOW + 100:
+            msg = f"Warning: TRACON bottom altitude is less than {DELETE_BELOW + 100}. TRACON will not be activated."
             return False, msg
 
         if not self.apt:
