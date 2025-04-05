@@ -7,12 +7,11 @@ import random
 import numpy as np
 from matplotlib.path import Path
 import bluesky as bs
-from bluesky import core, stack, sim, traf
+from bluesky import core, stack, sim, traf, navdb
 from bluesky.traffic.asas import ConflictDetection
 from bluesky.tools.areafilter import basic_shapes, deleteArea, defineArea, checkInside
 from bluesky.tools.aero import ft, nm, kts
-from bluesky.tools.geo import qdrpos, qdrdist, qdrdist_matrix, kwikqdrdist_matrix
-from bluesky.navdatabase import Navdatabase
+from bluesky.tools.geo import qdrpos, qdrdist, kwikqdrdist_matrix
 
 # Constants
 DELETE_BELOW = 200  # Aircraft (except taking off) below this field elevation will be automatically deleted [ft].
@@ -21,7 +20,7 @@ DELETE_DISTANCE = 5     # Aircraft (except arrival acf not in airspace yet) whos
 FAP_ELEVATION = 2000    # Final approach point elevation [ft].
 GLIDE_SLOPE = 3.0   # Glide slope [deg].
 
-navdb = Navdatabase()
+# navdb = Navdatabase()
 approach_bs = None
 
 # Plugin initialization function
@@ -40,7 +39,7 @@ def init_plugin():
     # Stack commands
     stackfunctions = {
         'APPBS_CRE': [
-            'APPBS_CRE acfid,acftype,lat,lon,hdg,alt,spd,intention,target_lat,target_lon',
+            'APPBS_CRE acfid, acftype, lat, lon, hdg, alt, spd, intention, target_lat, target_lon',
             'txt,txt,latlon,[hdg,alt,spd,txt,latlon]',
             approach_bs.appbs_cre,
             'Create an aircraft.'
@@ -153,8 +152,8 @@ class ApproachBS(core.Entity):
         """
         # Debug
         # stack.stack(f"ECHO {acfid} {acftype} {lat} {lon} {hdg} {alt} {spd} {intention}")
-        stack.stack(f"ECHO {acfid} {acftype} {lat} {lon} {hdg} {alt} {spd} {intention} {target_lat} {target_lon}")
-        return
+        # stack.stack(f"ECHO {acfid} {acftype} {lat} {lon} {hdg} {alt} {spd} {intention} {target_lat} {target_lon}")
+        # return
 
         if not self.tracon.is_active():
             msg = f"Aircraft {acfid} is not created. The TRACON is not active."
@@ -280,7 +279,7 @@ class ApproachBS(core.Entity):
             self.intention[-1] = 1
             # Set target waypoint to the departure waypoint of the assigned runway
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.depart_wp[target_wp_id]
-            stack.stack(f"{acfid}: to depart {target_wp_id}.")
+            stack.stack(f"ECHO {acfid}: to depart {target_wp_id}.")
             # Take-off clearance
             stack.stack(f"ALT {acfid} {self.tracon.bottom + 1000}; SPD {acfid} 180")
 
@@ -291,7 +290,7 @@ class ApproachBS(core.Entity):
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.fap[target_apt][target_rwy]
             # Set runway course
             self.rwy_course[-1] = self.tracon.rwy_thres[target_apt][target_rwy][2]
-            stack.stack(f"{acfid}: to land {target_apt}/{target_rwy}.")
+            stack.stack(f"ECHO {acfid}: to land {target_apt}/{target_rwy}.")
 
         return True
 
@@ -346,7 +345,7 @@ class ApproachBS(core.Entity):
             return new_invasion
         
         # Check lengths
-        assert len(lat) == len(lon) == len(alt) == len(traf.ntraf), \
+        assert len(lat) == len(lon) == len(alt) == traf.ntraf, \
             "Length of lat, lon, and alt must be equal to the number of aircrafts."
         
         # Iterate through areas
@@ -362,7 +361,7 @@ class ApproachBS(core.Entity):
         return new_invasion
 
 
-    # @core.timed_function(name='appbs_update_manager', dt=0.1)
+    @core.timed_function(name='appbs_update_manager', dt=0.1)
     def update(self):
         ''' This function gets called automatically every 0.1 second. '''
 
@@ -410,7 +409,7 @@ class ApproachBS(core.Entity):
             return
         
         # Check if the aircraft is out of range
-        dist_from_ctr = qdrdist_matrix(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat, traf.lon)[1]
+        dist_from_ctr = qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat, traf.lon)[1]
         self.out_of_range = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
 
         # under_ctrl
@@ -1192,7 +1191,7 @@ class Tracon:
         # Register the waypoint to the simulator
         navdb.defwpt(wp_id, lat, lon, "FIX")
         # Debug message
-        print(f"{wp_id} is added to the departure waypoints.")
+        # print(f"{wp_id} is added to the departure waypoints.")
 
         return True
         
