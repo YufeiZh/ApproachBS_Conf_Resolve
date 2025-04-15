@@ -79,10 +79,10 @@ class ApproachBS(core.Entity):
     def __init__(self):
         super().__init__()
 
+        self.mode = 'debug'         # Simulation mode: default, debug, or sim
+        
         # Simulator settings
         stack.stack("ASAS ON")
-
-        self.mode = 'debug'         # Simulation mode: default, debug, or test
 
         # Tracon
         self.tracon = Tracon()
@@ -173,36 +173,37 @@ class ApproachBS(core.Entity):
         Create an aircraft. Provides stack command APPBS_CRE.
         This is the preferred method to create an aircraft in ApproachBS in place of CRE.
         """
-        # Debug
-        # stack.stack(f"ECHO {acfid} {acftype} {lat} {lon} {hdg} {alt} {spd} {intention}")
-        # stack.stack(f"ECHO {acfid} {acftype} {lat} {lon} {hdg} {alt} {spd} {intention} {target_lat} {target_lon}")
-        # return
 
         if not self.tracon.is_active():
             msg = f"Aircraft {acfid} is not created. The TRACON is not active."
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return False, msg
         
         if len(traf.id) >= 50:
             msg = f"Aircraft {acfid} is not created. The number of aircrafts has reached the upper limit 50."
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return False, msg
         
         if acfid in traf.id:
             msg = f"Aircraft {acfid} is not created. Aircraft {acfid} already exists."
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return False, msg
         
         if intention not in ["ARRIVAL", "DEPARTURE"]:
             msg = f"Aircraft {acfid} is not created. The intention {intention} is not valid."
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return False, msg
 
         # Departure aircraft
         if intention == "DEPARTURE":
             # Parse the position
             if lat == 361.0 or lon == 361.0:
-                stack.stack(f"ECHO Aircraft position is not specified. Using random runway.")
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Aircraft position is not specified. Using random runway.")
                 # Choose a random airport and runway for take-off
                 apt = random.choice(list(self.tracon.dep_rwy_id.keys()))
                 rwy = random.choice(self.tracon.dep_rwy_id[apt])
@@ -223,14 +224,16 @@ class ApproachBS(core.Entity):
                             min_apt = apt
                             min_rwy = rwy
                 if min_dist >= 1.0:
-                    stack.stack(f"ECHO Aircraft position is not a valid runway. Using the closest runway.")
+                    if self.mode != 'sim':
+                        stack.stack(f"ECHO Aircraft position is not a valid runway. Using the closest runway.")
                 lat, lon = rwy_lat, rwy_lon
                 hdg = self.tracon.rwy_thres[min_apt][min_rwy][2]
                 alt = self.tracon.apt[min_apt][2]
                 spd = 0.0
             # Parse the departure waypoint
             if target_lat == 361.0 or target_lon == 361.0:
-                stack.stack(f"ECHO Aircraft target waypoint is not specified. Using random departure waypoint.")
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Aircraft target waypoint is not specified. Using random departure waypoint.")
                 # Choose a random departure waypoint
                 target_wp_id = random.choice(list(self.tracon.depart_wp.keys()))
             else:
@@ -243,13 +246,15 @@ class ApproachBS(core.Entity):
                         min_dist = dist
                         target_wp_id = wp_id
                 if min_dist >= 2.0:
-                    stack.stack(f"ECHO Aircraft target waypoint is not valid. Using the closest departure waypoint.")
+                    if self.mode != 'sim':
+                        stack.stack(f"ECHO Aircraft target waypoint is not valid. Using the closest departure waypoint.")
 
         # Arrival aircraft
         else:
             # Parse the position
             if lat == 361.0 or lon == 361.0:
-                stack.stack(f"ECHO Aircraft position is not specified. Using random position.")
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Aircraft position is not specified. Using random position.")
                 # Same logic as generating random arrival aircrafts
                 count = 0
                 while True:
@@ -271,7 +276,8 @@ class ApproachBS(core.Entity):
                     spd = 180.0 * kts
             # Parse the arrival runway
             if target_lat == 361.0 or target_lon == 361.0:
-                stack.stack(f"ECHO Arrival airport is not specified. Using random arrival airport.")
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Arrival airport is not specified. Using random arrival airport.")
                 # Choose a random arrival airport and runway
                 target_apt = random.choice(list(self.tracon.arr_rwy_id.keys()))
                 target_rwy = random.choice(self.tracon.arr_rwy_id[apt])
@@ -285,7 +291,8 @@ class ApproachBS(core.Entity):
                         min_dist = dist
                         target_apt = apt
                 if min_dist >= 1.0:
-                    stack.stack(f"ECHO Arrival airport is not valid or not open for arrival. Using the closest arrival airport.")
+                    if self.mode != 'sim':
+                        stack.stack(f"ECHO Arrival airport is not valid or not open for arrival. Using the closest arrival airport.")
                 target_rwy = random.choice(self.tracon.arr_rwy_id[target_apt])
         
         # Create new aircraft using traf.cre
@@ -302,7 +309,8 @@ class ApproachBS(core.Entity):
             self.intention[-1] = 1
             # Set target waypoint to the departure waypoint of the assigned runway
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.depart_wp[target_wp_id]
-            stack.stack(f"ECHO {acfid}: to depart {target_wp_id}.")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {acfid}: to depart {target_wp_id}.")
             # Take-off clearance
             stack.stack(f"ALT {acfid} {self.tracon.bottom + 1000}; SPD {acfid} 180")
 
@@ -313,7 +321,8 @@ class ApproachBS(core.Entity):
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.fap[target_apt][target_rwy]
             # Set runway course
             self.rwy_course[-1] = self.tracon.rwy_thres[target_apt][target_rwy][2]
-            stack.stack(f"ECHO {acfid}: to land {target_apt}/{target_rwy}.")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {acfid}: to land {target_apt}/{target_rwy}.")
 
         return True
 
@@ -455,7 +464,7 @@ class ApproachBS(core.Entity):
         while len(traf.id) > 50:
             delete_id.append(traf.id[-1])
             traf.delete(-1)
-        if delete_id:
+        if delete_id and self.mode != 'sim':
             stack.stack(f"ECHO Aircrafts {delete_id} are deleted due to excess number of aircrafts (50).")
 
     
@@ -466,13 +475,15 @@ class ApproachBS(core.Entity):
         i = 0
         while i < len(traf.id):
             if self.take_over[i] and self.out_of_range[i]:
-                stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
                 traf.delete(i)
                 i -= 1
             elif self.mode == 'default':
                 if qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[i], traf.lon[i])[1] > self.tracon.range + 20:
                     # Force deleting aircrafts too far away from the TRACON
-                    stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
+                    if self.mode != 'sim':
+                        stack.stack(f"ECHO Aircraft {traf.id[i]} is deleted due to out-of-range.")
                     traf.delete(i)
                     i -= 1
             i += 1
@@ -650,22 +661,26 @@ class ApproachBS(core.Entity):
         self.wp_lon[mask_no_intention] = self.tracon.depart_wp[depart_wp][1]
         self.wp_alt[mask_no_intention] = self.tracon.depart_wp[depart_wp][2]
 
-        stack.stack(f"ECHO Aircrafts without intention are set to Departure. Target waypoint: {depart_wp}.")
+        if self.mode != 'sim':
+            stack.stack(f"ECHO Aircrafts without intention are set to Departure. Target waypoint: {depart_wp}.")
 
 
     def appbs_activate(self):
         """ Activate the TRACON. """
         if self.tracon.is_active():
-            stack.stack("ECHO The airspace is already activated.")
+            if self.mode != 'sim':
+                stack.stack("ECHO The airspace is already activated.")
             return False
         
         # Activate the TRACON
         self.tracon.activate()
         active, msg = self.tracon.activate()
         if not active:
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return False
-        stack.stack("ECHO The airspace is activated.")
+        if self.mode != 'sim':
+            stack.stack("ECHO The airspace is activated.")
         return True
     
 
@@ -695,6 +710,10 @@ class ApproachBS(core.Entity):
         # generation rate
         msg += f"ARR AIRCRAFTS: {self.auto_gen_setting['arr_gen_rate']:.1f}ACFT/min\n"
         msg += f"DEP AIRCRAFTS: {self.auto_gen_setting['dep_gen_rate']:.1f}ACFT/min\n"
+
+        if self.mode != 'sim':
+            stack.stack(f"ECHO {msg}")
+        return True
 
 
     def appbs_pos(self, acfidx: int=None):
@@ -741,8 +760,8 @@ class ApproachBS(core.Entity):
             # vector
             msg += "VEC\t" if self.radar_vector[acfidx] else "NAV\t"
 
-            # debug or test mode only
-            if self.mode == 'debug' or self.mode == 'test':
+            # debug mode only
+            if self.mode == 'debug':
                 msg += f"(WP:{self.dist_to_wp[acfidx]:.1f}/{self.bearing_to_wp[acfidx]:.1f}/{self.rwy_course[acfidx]:.1f})\t"
                 msg += f"(T:{self.time_entered[acfidx]:.1f}/{self.time_last_cmd[acfidx]:.1f})\t"
                 msg += f"(TO/OR:{self.take_over[acfidx]}/{self.out_of_range[acfidx]})\t"
@@ -754,13 +773,15 @@ class ApproachBS(core.Entity):
             return msg
 
         if acfidx is not None and 0 <= acfidx < len(traf.id):
-            stack.stack(f"ECHO {pos_acf(acfidx)}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {pos_acf(acfidx)}")
             return True
         else:
             msg = ""
             for idx in range(len(traf.id)):
                 msg += f"{pos_acf(idx)}\n"
-            stack.stack(f"ECHO {msg}")
+            if self.mode != 'sim':
+                stack.stack(f"ECHO {msg}")
             return True 
 
 
