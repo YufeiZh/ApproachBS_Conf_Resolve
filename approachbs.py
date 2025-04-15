@@ -49,7 +49,25 @@ def init_plugin():
             '',
             approach_bs.appbs_activate,
             'Activate the TRACON.'
-        ]
+        ],
+        'APPBS_BRIEF': [
+            'APPBS_BRIEF',
+            '',
+            approach_bs.appbs_brief,
+            'Brief the TRACON.'
+        ],
+        'APPBS_POS': [
+            'APPBS_POS acid',
+            '[acid]',
+            approach_bs.appbs_pos,
+            'Get info of the aircraft.'
+        ],
+        'APPBS_GENRATE': [
+            'APPBS_GENRATE arr_gen_rate, dep_gen_rate',
+            '[int,int]',
+            approach_bs.appbs_genrate,
+            'Set the generation rate of arrival and departure aircrafts.'
+        ],
     }
     
     return config, stackfunctions
@@ -80,9 +98,6 @@ class ApproachBS(core.Entity):
         self.conflict_three_minute.rpz_def = 5.0 * nm  # Horizontal separation [m]
         self.conflict_three_minute.hpz_def = 1000.0 * ft  # Vertical separation [m]
         self.conflict_three_minute.dtlookahead_def = 180.0  # Lookahead time [s]
-
-        # Scenario info
-        self.n_abnormal_acf = 0
 
         with self.settrafarrays():
 
@@ -440,7 +455,8 @@ class ApproachBS(core.Entity):
         while len(traf.id) > 50:
             delete_id.append(traf.id[-1])
             traf.delete(-1)
-        stack.stack(f"ECHO Aircrafts {delete_id} are deleted due to excess number of aircrafts (50).")
+        if delete_id:
+            stack.stack(f"ECHO Aircrafts {delete_id} are deleted due to excess number of aircrafts (50).")
 
     
     def appbs_auto_delete_acfs(self):
@@ -653,6 +669,115 @@ class ApproachBS(core.Entity):
         return True
     
 
+    def appbs_brief(self):
+        """
+        Brief the info of the area 
+        """
+        msg = f"{self.tracon.identifier}: "
+        msg += "ACTIVE, " if self.tracon.is_active() else "INACTIVE, "
+        msg += f"RANGE: {self.tracon.range}NM/{self.tracon.bottom} to {self.tracon.top},"
+        msg += f"ACFS: {len(traf.id)}, "
+        msg += f"IN AREA: {np.sum(self.under_ctrl)}\n"
+
+        # open runway info
+        msg += "DEP RWY:\n"
+        for apt in self.tracon.dep_rwy_id:
+            for rwy in self.tracon.dep_rwy_id[apt]:
+                msg += f"{apt}/{rwy}, "
+        msg += "\n"
+        msg += "ARR RWY:\n"
+        for apt in self.tracon.arr_rwy_id:
+            for rwy in self.tracon.arr_rwy_id[apt]:
+                msg += f"{apt}/{rwy}, "
+        msg += "\n"
+
+
+        # generation rate
+        msg += f"ARR AIRCRAFTS: {self.auto_gen_setting['arr_gen_rate']:.1f}ACFT/min\n"
+        msg += f"DEP AIRCRAFTS: {self.auto_gen_setting['dep_gen_rate']:.1f}ACFT/min\n"
+
+
+    def appbs_pos(self, acfidx: int=None):
+        """ 
+        Echo the information of the aircraft. 
+        acfid: index of the aircraft or None for all aircrafts.
+        """
+
+        def pos_acf(acfidx):
+            """ Get the info of single aircraft. """
+            msg = f"{traf.id[acfidx]}:\t"
+
+            # position
+            bearing, dist = qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[acfidx], traf.lon[acfidx])
+            bearing = (bearing + 360) % 360
+            if 22.5 <= bearing < 67.5:
+                direction = "NE"
+            elif 67.5 <= bearing < 112.5:
+                direction = "E "
+            elif 112.5 <= bearing < 157.5:
+                direction = "SE"
+            elif 157.5 <= bearing < 202.5:
+                direction = "S "
+            elif 202.5 <= bearing < 247.5:
+                direction = "SW"
+            elif 247.5 <= bearing < 292.5:
+                direction = "W "
+            elif 292.5 <= bearing < 337.5:
+                direction = "NW"
+            else:
+                direction = "N "
+            dist = round(dist, 1)
+            msg += f"{dist}/{direction}\t"
+
+            # dynamics
+            trk = round(traf.trk[acfidx])
+            alt = round(traf.alt[acfidx] / ft)
+            spd = round(traf.gs[acfidx] / kts)
+            msg += f"at {trk}/{alt}/{spd}\t"
+
+            # intention
+            msg += "ARR\t" if self.intention[acfidx] == 0 else "DEP\t"
+
+            # vector
+            msg += "VEC\t" if self.radar_vector[acfidx] else "NAV\t"
+
+            # debug or test mode only
+            if self.mode == 'debug' or self.mode == 'test':
+                msg += f"(WP:{self.dist_to_wp[acfidx]:.1f}/{self.bearing_to_wp[acfidx]:.1f}/{self.rwy_course[acfidx]:.1f})\t"
+                msg += f"(T:{self.time_entered[acfidx]:.1f}/{self.time_last_cmd[acfidx]:.1f})\t"
+                msg += f"(TO/OR:{self.take_over[acfidx]}/{self.out_of_range[acfidx]})\t"
+
+            # other status
+            if not self.under_ctrl[acfidx]:
+                msg += "OUT\t"
+
+            return msg
+
+        if acfidx is not None and 0 <= acfidx < len(traf.id):
+            stack.stack(f"ECHO {pos_acf(acfidx)}")
+            return True
+        else:
+            msg = ""
+            for idx in range(len(traf.id)):
+                msg += f"{pos_acf(idx)}\n"
+            stack.stack(f"ECHO {msg}")
+            return True 
+
+
+    def appbs_genrate(self, dep_rate: float=None, arr_rate: float=None):
+        """ 
+        Set the generation rate of departure and arrival aircrafts. 
+        """
+        if dep_rate is None or dep_rate < 0.0:
+            dep_rate = 0.0
+        if arr_rate is None or arr_rate < 0.0:
+            arr_rate = 0.0
+        
+        self.auto_gen_setting['dep_gen_rate'] = dep_rate
+        self.auto_gen_setting['arr_gen_rate'] = arr_rate
+        return True
+
+
 class MyConflictDetection(ConflictDetection):
     """
     Custom conflict detection class for TRACON operations.
@@ -698,6 +823,31 @@ class MyConflictDetection(ConflictDetection):
     def setdtnolook(self):
         """ Override the setdtnolook function to avoid stack commands handling. """
         pass
+
+
+    def update(self, ownship, intruder):
+        ''' Custom update step to handle zero-aircraft case. '''
+        if ownship.ntraf == 0 or intruder.ntraf == 0:
+            self.confpairs_all.clear()
+            self.lospairs_all.clear()
+            self.confpairs_unique.clear()
+            self.lospairs_unique.clear()
+            return
+        self.confpairs, self.lospairs, self.inconf, self.tcpamax, self.qdr, \
+            self.dist, self.dcpa, self.tcpa, self.tLOS = \
+                self.detect(ownship, intruder, self.rpz, self.hpz, self.dtlookahead)
+
+        # confpairs has conflicts observed from both sides (a, b) and (b, a)
+        # confpairs_unique keeps only one of these
+        confpairs_unique = {frozenset(pair) for pair in self.confpairs}
+        lospairs_unique = {frozenset(pair) for pair in self.lospairs}
+
+        self.confpairs_all.extend(confpairs_unique - self.confpairs_unique)
+        self.lospairs_all.extend(lospairs_unique - self.lospairs_unique)
+
+        # Update confpairs_unique and lospairs_unique
+        self.confpairs_unique = confpairs_unique
+        self.lospairs_unique = lospairs_unique
 
 
     def detect(self, ownship, intruder, rpz, hpz, dtlookahead):
