@@ -433,6 +433,10 @@ class ApproachBS(core.Entity):
                     self.radar_vector[new_index] = True # Vectoring
                     self.time_entered[new_index] = sim.simt  # Record the entering time
 
+        # Update distance and bearing to the target waypoint
+        mask = (self.wp_lat != 361.0) & (self.wp_lon != 361.0)
+        self.bearing_to_wp[mask], self.dist_to_wp[mask] = qdrdist(traf.lat[mask], traf.lon[mask], self.wp_lat[mask], self.wp_lon[mask])
+
         # Check if the aircraft received a command
         received_cmd = np.zeros_like(traf.id, dtype=bool)
         for i in range(len(self.prev_acf_id)):
@@ -690,7 +694,7 @@ class ApproachBS(core.Entity):
         """
         msg = f"{self.tracon.identifier}: "
         msg += "ACTIVE, " if self.tracon.is_active() else "INACTIVE, "
-        msg += f"RANGE: {self.tracon.range}NM/{self.tracon.bottom} to {self.tracon.top},"
+        msg += f"RANGE: {self.tracon.range}NM/{self.tracon.bottom}FT to {self.tracon.top}FT, "
         msg += f"ACFS: {len(traf.id)}, "
         msg += f"IN AREA: {np.sum(self.under_ctrl)}\n"
 
