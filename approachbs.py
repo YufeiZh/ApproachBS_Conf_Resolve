@@ -64,7 +64,7 @@ def init_plugin():
         ],
         'APPBS_GENRATE': [
             'APPBS_GENRATE arr_gen_rate, dep_gen_rate',
-            '[int,int]',
+            '[float,float]',
             approach_bs.appbs_genrate,
             'Set the generation rate of arrival and departure aircrafts.'
         ],
@@ -150,6 +150,8 @@ class ApproachBS(core.Entity):
         }
         self.last_dep_gen_time = 0.0  # Last generation time for departure aircrafts [s]
         self.last_arr_gen_time = 0.0  # Last generation time for arrival aircrafts [s]
+        self.next_dep_gen_sep = float('inf')
+        self.next_arr_gen_sep = float('inf')
         
         # Timers
         self.update_timer = core.Timer(name='appbs_update', dt=0.1)
@@ -226,7 +228,7 @@ class ApproachBS(core.Entity):
                 if min_dist >= 1.0:
                     if self.mode != 'sim':
                         stack.stack(f"ECHO Aircraft position is not a valid runway. Using the closest runway.")
-                lat, lon = rwy_lat, rwy_lon
+                lat, lon = self.tracon.rwy_thres[min_apt][min_rwy][:2]
                 hdg = self.tracon.rwy_thres[min_apt][min_rwy][2]
                 alt = self.tracon.apt[min_apt][2]
                 spd = 0.0
@@ -412,7 +414,7 @@ class ApproachBS(core.Entity):
         self.out_of_range = (dist_from_ctr > self.tracon.range + DELETE_DISTANCE) | (traf.alt < self.tracon.elevation + DELETE_BELOW)
 
         # under_ctrl
-        self.under_ctrl = (dist_from_ctr < self.tracon.range) & (traf.alt >= self.tracon.bottom) & (traf.alt <= self.tracon.top)
+        self.under_ctrl = (dist_from_ctr < self.tracon.range) & (traf.alt >= self.tracon.bottom * ft) & (traf.alt <= self.tracon.top * ft)
 
         # Take over aircrafts in the TRACON airspace
         self.take_over = self.take_over | self.under_ctrl
@@ -436,6 +438,7 @@ class ApproachBS(core.Entity):
         # Update distance and bearing to the target waypoint
         mask = (self.wp_lat != 361.0) & (self.wp_lon != 361.0)
         self.bearing_to_wp[mask], self.dist_to_wp[mask] = qdrdist(traf.lat[mask], traf.lon[mask], self.wp_lat[mask], self.wp_lon[mask])
+        self.bearing_to_wp[mask] = (self.bearing_to_wp[mask] + 360) % 360  # Normalize to [0, 360)
 
         # Check if the aircraft received a command
         received_cmd = np.zeros_like(traf.id, dtype=bool)
@@ -465,7 +468,7 @@ class ApproachBS(core.Entity):
     def appbs_delete_excess_acfs(self):
         ''' Periodically delete aircrafts if there re more than 50 aircrafts. '''
         delete_id = []
-        while len(traf.id) > 50:
+        while traf.ntraf > 50:
             delete_id.append(traf.id[-1])
             traf.delete(-1)
         if delete_id and self.mode != 'sim':
@@ -558,7 +561,10 @@ class ApproachBS(core.Entity):
 
     def generate_dep_acf(self):
         ''' Periodically generate departure aircrafts based on generation settings. '''
-        if not self.tracon.is_active() or self.auto_gen_setting['dep_gen_rate'] <= 0.0:
+        if not self.tracon.is_active() \
+            or self.auto_gen_setting['dep_gen_rate'] <= 0.0 \
+                or traf.ntraf >= 50 \
+                    or sim.simt-self.last_dep_gen_time < self.next_dep_gen_sep:
             return
         
         # Choose a random departure airport first
@@ -566,90 +572,92 @@ class ApproachBS(core.Entity):
         while True:
             apt = random.choice(list(self.tracon.dep_rwy_id.keys()))
             # Cannot take-off from this airport if there are aircrafts within 5NM
-            if np.min(qdrdist(self.tracon.apt[apt][0], self.tracon.apt[apt][1], traf.lat, traf.lon)[1]) > 5.0:
+            if traf.ntraf == 0 or np.min(qdrdist(self.tracon.apt[apt][0], self.tracon.apt[apt][1], traf.lat, traf.lon)[1]) > 5.0:
                 break
             count += 1
-            if count > 20:
+            if count > 5:
                 # No valid airpot found, abort generation
                 return
 
         rwy = random.choice(self.tracon.dep_rwy_id[apt])
         
-        
-        gen_separation = 60.0 / self.auto_gen_setting['dep_gen_rate']  # [s]
-        time_diff = sim.simt - self.last_dep_gen_time
-        # Use Gaussian distribution to decide when to generate the next aircraft
-        excess_time = time_diff - gen_separation
-        distribution = random.gauss(0, gen_separation / 10)
-        if excess_time > distribution:
-            # Generate a departure aircraft
-            # Choose a random departure waypoint
-            waypoint = random.choice(list(self.tracon.depart_wp.keys()))
-            # Generate a random aircraft ID
-            acfid = "DEP"
-            for i in range(1, 51):
-                if f"{acfid}{i:04}" not in traf.id:
-                    acfid = f"{acfid}{i:04}"
-                    break
-            # Use default aircraft type B737
-            self.appbs_cre(acfid=acfid,
-                           acftype="B737",
-                           intention="DEPARTURE",
-                           target_wp_id=waypoint,
-                           dep_rwy_id=f"{apt}/{rwy}")
-            # Update the last generation time
-            self.last_dep_gen_time = sim.simt
-        
+        # Generate a departure aircraft
+        # Choose a random departure waypoint
+        waypoint = random.choice(list(self.tracon.depart_wp.keys()))
+        # Generate a random aircraft ID
+        acfid = "DEP"
+        for i in range(1, 51):
+            if f"{acfid}{i:04}" not in traf.id:
+                acfid = f"{acfid}{i:04}"
+                break
+        # Use default aircraft type B737
+        self.appbs_cre(acfid=acfid,
+                        acftype="B737",
+                        lat=self.tracon.rwy_thres[apt][rwy][0],
+                        lon=self.tracon.rwy_thres[apt][rwy][1],
+                        intention="DEPARTURE",
+                        target_lat=self.tracon.depart_wp[waypoint][0],
+                        target_lon=self.tracon.depart_wp[waypoint][1])
+        # Update the last generation time
+        self.last_dep_gen_time = sim.simt
+        # Sample next generation separation time
+        gen_separation = 60.0 / self.auto_gen_setting['dep_gen_rate']
+        self.next_dep_gen_sep = random.gauss(gen_separation, gen_separation / 10)
+
 
     def generate_arr_acf(self):
         ''' Periodically generate arrival aircrafts based on generation settings. '''
-        if not self.tracon.is_active() or self.auto_gen_setting['arr_gen_rate'] <= 0.0:
+        if not self.tracon.is_active() \
+            or self.auto_gen_setting['arr_gen_rate'] <= 0.0 \
+                or traf.ntraf >= 50 \
+                    or sim.simt-self.last_arr_gen_time < self.next_arr_gen_sep:
             return
         
+        # Generate an arrival aircraft
+        # Determaine the approach direction and altitude
+        count = 0
+        while True:
+            # Choose a direction from the center of the TRACON
+            direction = random.random() * 360.0
+            # Get the vertical envelope from this direction
+            min_alt, max_alt = self.tracon.get_vertical_envelope(direction)
+            # Cannot approach from this direction if the altitude is too low
+            if max_alt <= self.tracon.top - 1100 or min_alt >= self.tracon.top - 900:
+                alt = self.tracon.top - 1000
+                break
+            # If the altitude is too low, try again
+            count += 1
+            if count > 20:
+                alt = self.tracon.top - 1000
+                break
+        # Get the position of the aircraft
+        lat, lon = qdrpos(self.tracon.ctr_lat, self.tracon.ctr_lon, direction, self.tracon.range + 5.0)
+        # Choose a random arrival runway
+        apt = random.choice(list(self.tracon.arr_rwy_id.keys()))
+        rwy = random.choice(self.tracon.arr_rwy_id[apt])
+        # Generate a random aircraft ID
+        acfid = "ARR"
+        for i in range(1, 51):
+            if f"{acfid}{i:04}" not in traf.id:
+                acfid = f"{acfid}{i:04}"
+                break
+        # Use default aircraft type B737
+        # Always flying towards the center of the TRACON
+        self.appbs_cre(acfid=acfid,
+                        acftype="B737",
+                        lat=lat,
+                        lon=lon,
+                        hdg=(direction + 180) % 360,
+                        alt=alt * ft,
+                        spd=250 * kts,
+                        intention="ARRIVAL",
+                        target_lat=self.tracon.rwy_thres[apt][rwy][0],
+                        target_lon=self.tracon.rwy_thres[apt][rwy][1])
+        # Update the last generation time
+        self.last_arr_gen_time = sim.simt
+        # Sample next generation separation time
         gen_separation = 60.0 / self.auto_gen_setting['arr_gen_rate']
-        time_diff = sim.simt - self.last_arr_gen_time
-        # Use Gaussian distribution to decide when to generate the next aircraft
-        excess_time = time_diff - gen_separation
-        distribution = random.gauss(0, gen_separation / 10)
-        if excess_time > distribution:
-            # Generate an arrival aircraft
-            # Determaine the approach direction and altitude
-            count = 0
-            while True:
-                # Choose a direction from the center of the TRACON
-                direction = random.random() * 360.0
-                # Get the vertical envolope from this direction
-                min_alt, max_alt = self.tracon.get_vertical_envelope(direction)
-                # Cannot approach from this direction if the altitude is too low
-                if max_alt <= self.tracon.top - 1100 or min_alt >= self.tracon.top - 900:
-                    alt = self.tracon.top - 1000
-                    break
-                # If the altitude is too low, try again
-                count += 1
-                if count > 20:
-                    alt = self.tracon.top - 1000
-                    break
-            # Get the position of the aircraft
-            lat, lon = qdrpos(self.tracon.ctr_lat, self.tracon.ctr_lon, direction, self.tracon.range + 5.0)
-            # Choose a random arrival runway
-            apt = random.choice(list(self.tracon.arr_rwy_id.keys()))
-            rwy = random.choice(self.tracon.arr_rwy_id[apt])
-            # Generate a random aircraft ID
-            acfid = "ARR"
-            for i in range(1, 51):
-                if f"{acfid}{i:04}" not in traf.id:
-                    acfid = f"{acfid}{i:04}"
-                    break
-            # Use default aircraft type B737
-            # Always flying towards the center of the TRACON
-            self.appbs_cre(acfid=acfid,
-                           acftype="B737",
-                           pos=(lat, lon),
-                           hdg=(direction + 180) % 360,
-                           alt=alt * ft,
-                           spd=250 * kts,
-                           intention="ARRIVAL",
-                           target_wp_id=f"{apt}/{rwy}")
+        self.next_arr_gen_sep = random.gauss(gen_separation, gen_separation / 10)
 
 
     def handle_no_intention_acfs(self):
@@ -692,31 +700,33 @@ class ApproachBS(core.Entity):
         """
         Brief the info of the area 
         """
-        msg = f"{self.tracon.identifier}: "
-        msg += "ACTIVE, " if self.tracon.is_active() else "INACTIVE, "
-        msg += f"RANGE: {self.tracon.range}NM/{self.tracon.bottom}FT to {self.tracon.top}FT, "
-        msg += f"ACFS: {len(traf.id)}, "
-        msg += f"IN AREA: {np.sum(self.under_ctrl)}\n"
+        if self.mode == 'sim':
+            return True
+        
+        line = f"{self.tracon.identifier}: "
+        line += "ACTIVE, " if self.tracon.is_active() else "INACTIVE, "
+        line += f"RANGE: {self.tracon.range}NM/{self.tracon.bottom}FT to {self.tracon.top}FT, "
+        line += f"ACFS: {len(traf.id)}, "
+        line += f"IN AREA: {np.sum(self.under_ctrl)}"
+        stack.stack(f"ECHO {line}")
 
         # open runway info
-        msg += "DEP RWY:\n"
+        line = "DEP RWY: "
         for apt in self.tracon.dep_rwy_id:
             for rwy in self.tracon.dep_rwy_id[apt]:
-                msg += f"{apt}/{rwy}, "
-        msg += "\n"
-        msg += "ARR RWY:\n"
+                line += f"{apt}/{rwy}, "
+        stack.stack(f"ECHO {line}")
+        line = "ARR RWY: "
         for apt in self.tracon.arr_rwy_id:
             for rwy in self.tracon.arr_rwy_id[apt]:
-                msg += f"{apt}/{rwy}, "
-        msg += "\n"
-
+                line += f"{apt}/{rwy}, "
+        stack.stack(f"ECHO {line}")
 
         # generation rate
-        msg += f"ARR AIRCRAFTS: {self.auto_gen_setting['arr_gen_rate']:.1f}ACFT/min\n"
-        msg += f"DEP AIRCRAFTS: {self.auto_gen_setting['dep_gen_rate']:.1f}ACFT/min\n"
-
-        if self.mode != 'sim':
-            stack.stack(f"ECHO {msg}")
+        line = f"ARR AIRCRAFTS GENERATION: {self.auto_gen_setting['arr_gen_rate']:.1f}ACFS/MIN\t"
+        line += f"DEP AIRCRAFTS GENERATION: {self.auto_gen_setting['dep_gen_rate']:.1f}ACFS/MIN"
+        stack.stack(f"ECHO {line}")
+        
         return True
 
 
@@ -725,10 +735,12 @@ class ApproachBS(core.Entity):
         Echo the information of the aircraft. 
         acfid: index of the aircraft or None for all aircrafts.
         """
+        if self.mode == 'sim':
+            return True
 
         def pos_acf(acfidx):
             """ Get the info of single aircraft. """
-            msg = f"{traf.id[acfidx]}:\t"
+            msg = f"{traf.id[acfidx]}\t"
 
             # position
             bearing, dist = qdrdist(self.tracon.ctr_lat, self.tracon.ctr_lon, traf.lat[acfidx], traf.lon[acfidx])
@@ -755,8 +767,9 @@ class ApproachBS(core.Entity):
             # dynamics
             trk = round(traf.trk[acfidx])
             alt = round(traf.alt[acfidx] / ft)
-            spd = round(traf.gs[acfidx] / kts)
-            msg += f"at {trk}/{alt}/{spd}\t"
+            spd = round(traf.cas[acfidx] / kts)
+            gs = round(traf.gs[acfidx] / kts)
+            msg += f"at {trk}/{alt}/{spd}/{gs}\t"
 
             # intention
             msg += "ARR\t" if self.intention[acfidx] == 0 else "DEP\t"
@@ -777,15 +790,11 @@ class ApproachBS(core.Entity):
             return msg
 
         if acfidx is not None and 0 <= acfidx < len(traf.id):
-            if self.mode != 'sim':
-                stack.stack(f"ECHO {pos_acf(acfidx)}")
+            stack.stack(f"ECHO {pos_acf(acfidx)}")
             return True
         else:
-            msg = ""
             for idx in range(len(traf.id)):
-                msg += f"{pos_acf(idx)}\n"
-            if self.mode != 'sim':
-                stack.stack(f"ECHO {msg}")
+                stack.stack(f"ECHO {pos_acf(idx)}")
             return True 
 
 
@@ -800,6 +809,7 @@ class ApproachBS(core.Entity):
         
         self.auto_gen_setting['dep_gen_rate'] = dep_rate
         self.auto_gen_setting['arr_gen_rate'] = arr_rate
+        self.next_arr_gen_sep = self.next_dep_gen_sep = 0.0
         return True
 
 
@@ -1398,11 +1408,12 @@ class Tracon:
         return True
 
 
-    def get_vertical_envolope(self, bearing):
+    def get_vertical_envelope(self, bearing):
         """
         Get the vertical restrictions from the center with a given bearing.
-        When generating arbitrary arriving traffic, the vertical envelope is used to 
-         determine the altitude of the aircraft based on its bearing from the TRACON center.
+        When generating random arriving traffic, the vertical envelope is used to determine
+         the altitude of the aircraft based on its bearing from the TRACON center.
+        Using straight line segments instead of geodesics for simplicity.
         return: min_alt, max_alt (ft)
         """
 
@@ -1413,21 +1424,31 @@ class Tracon:
         end_lat, end_lon = qdrpos(self.ctr_lat, self.ctr_lon, bearing, self.range + 10)
         # Ray
         ray = np.array([[self.ctr_lat, self.ctr_lon], [end_lat, end_lon]])
+        ray_vec = np.array([end_lat - self.ctr_lat, end_lon - self.ctr_lon])
+        ray_norm = np.linalg.norm(ray_vec)
+        ray_path = Path(ray)
 
         for area_id in self.restrict:
-            try:
-                shape_path = basic_shapes[area_id].border # Get the shape path of the area
-            except KeyError:
-                print(f"Error: Restricted area {area_id} does not exist in simulator.")
-                continue
-            if shape_path is None:
-                print(f"Error: Restricted area {area_id} does not exist in simulator.")
-                continue
-            # use matplotlib to check if the ray intersects with the polygon
-            ray_path = Path(ray)
-            if shape_path.intersects(ray_path):
-                min_alt = min(min_alt, basic_shapes[area_id].bottom)
-                max_alt = max(max_alt, basic_shapes[area_id].top)
+            if self.restrict[area_id][0] == 0:
+                # circle
+                center_lat, center_lon, radius = self.restrict[area_id][3:6]
+                # calculate the projection vector
+                t = np.dot(ray_vec, np.array([center_lat - self.ctr_lat, center_lon - self.ctr_lon])) / (ray_norm ** 2)
+                t_clamped = np.clip(t, 0, 1)
+                # calculate closest point
+                closest_point = np.array([self.ctr_lat, self.ctr_lon]) + t_clamped * ray_vec
+                distance = np.linalg.norm(closest_point - np.array([center_lat, center_lon]))
+                if distance < radius:
+                    # intersecting
+                    min_alt = min(min_alt, self.restrict[area_id][1])
+                    max_alt = max(max_alt, self.restrict[area_id][2])
+            elif self.restrict[area_id][0] == 1:
+                # polygon
+                shape_path = Path(self.restrict[area_id][3:].reshape(-1, 2))
+                # use matplotlib to check if the ray intersects with the polygon
+                if shape_path.intersects_path(ray_path):
+                    min_alt = min(min_alt, self.restrict[area_id][1])
+                    max_alt = max(max_alt, self.restrict[area_id][2])
 
         return min_alt, max_alt
 
