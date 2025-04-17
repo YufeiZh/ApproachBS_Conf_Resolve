@@ -152,6 +152,8 @@ class ApproachBS(core.Entity):
         self.last_arr_gen_time = 0.0  # Last generation time for arrival aircrafts [s]
         self.next_dep_gen_sep = float('inf')
         self.next_arr_gen_sep = float('inf')
+        self.recent_arr_directions = [] # Record recent incoming aircraft directions to avoid conflicts
+        self.recent_arr_directions_max = 1 # Maximum number of recent directions to record
         
         # Timers
         self.update_timer = core.Timer(name='appbs_update', dt=0.1)
@@ -619,17 +621,28 @@ class ApproachBS(core.Entity):
         while True:
             # Choose a direction from the center of the TRACON
             direction = random.random() * 360.0
-            # Get the vertical envelope from this direction
-            min_alt, max_alt = self.tracon.get_vertical_envelope(direction)
-            # Cannot approach from this direction if the altitude is too low
-            if max_alt <= self.tracon.top - 1100 or min_alt >= self.tracon.top - 900:
-                alt = self.tracon.top - 1000
-                break
-            # If the altitude is too low, try again
+            # Avoid recent approach directions
+            valid_direction = True
+            for d in self.recent_arr_directions:
+                d_delta = abs(direction - d)
+                if d_delta > 180.0:
+                    d_delta = 360.0 - d_delta
+                if d_delta < 15.0:
+                    valid_direction = False
+                    break
+            if valid_direction:
+                # Get the vertical envelope from this direction
+                min_alt, max_alt = self.tracon.get_vertical_envelope(direction)
+                # Arrive from this direction if the altitude restriction allows
+                if max_alt <= self.tracon.top - 1100 or min_alt >= self.tracon.top - 900:
+                    alt = self.tracon.top - 1000
+                    break
             count += 1
-            if count > 20:
-                alt = self.tracon.top - 1000
-                break
+            if count > 30:
+                if self.mode != 'sim':
+                    stack.stack(f"ECHO Unable to generate arrival aircrafts at this time.")
+                return
+            
         # Get the position of the aircraft
         lat, lon = qdrpos(self.tracon.ctr_lat, self.tracon.ctr_lon, direction, self.tracon.range + 5.0)
         # Choose a random arrival runway
@@ -658,6 +671,10 @@ class ApproachBS(core.Entity):
         # Sample next generation separation time
         gen_separation = 60.0 / self.auto_gen_setting['arr_gen_rate']
         self.next_arr_gen_sep = random.gauss(gen_separation, gen_separation / 10)
+        # Record the recent approach direction
+        if len(self.recent_arr_directions) >= self.recent_arr_directions_max:
+            self.recent_arr_directions.pop(0)
+        self.recent_arr_directions.append(direction)
 
 
     def handle_no_intention_acfs(self):
@@ -810,6 +827,8 @@ class ApproachBS(core.Entity):
         self.auto_gen_setting['dep_gen_rate'] = dep_rate
         self.auto_gen_setting['arr_gen_rate'] = arr_rate
         self.next_arr_gen_sep = self.next_dep_gen_sep = 0.0
+
+        self.recent_arr_directions_max = int(arr_rate) + 1
         return True
 
 
