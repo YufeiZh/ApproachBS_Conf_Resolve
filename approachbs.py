@@ -62,12 +62,18 @@ def init_plugin():
             approach_bs.appbs_pos,
             'Get info of the aircraft.'
         ],
-        'APPBS_GENRATE': [
-            'APPBS_GENRATE arr_gen_rate, dep_gen_rate',
+        'APPBS_SET_GENRATE': [
+            'APPBS_SET_GENRATE arr_gen_rate, dep_gen_rate',
             '[float,float]',
-            approach_bs.appbs_genrate,
+            approach_bs.appbs_set_genrate,
             'Set the generation rate of arrival and departure aircrafts.'
         ],
+        'APPBS_LOS': [
+            'APPBS_LOS',
+            '',
+            approach_bs.appbs_los,
+            'Display Loss of Separation.'
+        ]
     }
     
     return config, stackfunctions
@@ -79,7 +85,7 @@ class ApproachBS(core.Entity):
     def __init__(self):
         super().__init__()
 
-        self.mode = 'debug'         # Simulation mode: default, debug, or sim
+        self.mode = 'default'         # Simulation mode: default, debug, or sim
         
         # Simulator settings
         stack.stack("ASAS ON")
@@ -105,6 +111,7 @@ class ApproachBS(core.Entity):
             self.radar_vector = np.array([], dtype=bool)  # Whether acf is being radar vectored or on self-navigation
                                                             # This will be used to assess whether an acf leaves airspace unexpectly
             self.intention = np.array([])   # 0 for arrival, 1 for departure, -1 for unknown
+            self.wp_id = []                 # ID of the target waypoint (for departure acfs) or arrival runway (for arrival acfs)
             self.wp_lat = np.array([])      # Latitude of the target waypoint [deg]
             self.wp_lon = np.array([])      # Longitude of the target waypoint [deg]
             self.wp_alt = np.array([])      # Designated altitude of the target waypoint [ft]
@@ -312,6 +319,7 @@ class ApproachBS(core.Entity):
         if intention == "DEPARTURE":
             self.intention[-1] = 1
             # Set target waypoint to the departure waypoint of the assigned runway
+            self.wp_id[-1] = target_wp_id
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.depart_wp[target_wp_id]
             if self.mode != 'sim':
                 stack.stack(f"ECHO {acfid}: to depart {target_wp_id}.")
@@ -322,6 +330,7 @@ class ApproachBS(core.Entity):
         else:
             self.intention[-1] = 0
             # Set target waypoint to the FAP of the assigned runway
+            self.wp_id[-1] = f"{target_apt}/{target_rwy}"
             self.wp_lat[-1], self.wp_lon[-1], self.wp_alt[-1] = self.tracon.fap[target_apt][target_rwy]
             # Set runway course
             self.rwy_course[-1] = self.tracon.rwy_thres[target_apt][target_rwy][2]
@@ -360,6 +369,8 @@ class ApproachBS(core.Entity):
         self.out_of_range[-n:] = False
         
         self.intention[-n:] = -1
+        for i in range(n):
+            self.wp_id[-n+i] = "N/A"
         self.wp_lat[-n:] = 361.0
         self.wp_lon[-n:] = 361.0
         self.wp_alt[-n:] = -1000.0
@@ -401,7 +412,7 @@ class ApproachBS(core.Entity):
             self.generate_arr_acf()
 
         # No intention aircrafts
-        if self.update_timer.readynext() and self.tracon.is_active() and self.mode == 'default':
+        if self.update_timer.readynext() and self.tracon.is_active():
             self.handle_no_intention_acfs()
 
 
@@ -686,11 +697,16 @@ class ApproachBS(core.Entity):
         self.intention[mask_no_intention] = 1  # Set intention to Departure
         # Target waypoint
         depart_wp = random.choice(list(self.tracon.depart_wp.keys()))
+        for i in range(len(self.wp_id)):
+            if mask_no_intention[i]:
+                self.wp_id[i] = depart_wp
         self.wp_lat[mask_no_intention] = self.tracon.depart_wp[depart_wp][0]
         self.wp_lon[mask_no_intention] = self.tracon.depart_wp[depart_wp][1]
         self.wp_alt[mask_no_intention] = self.tracon.depart_wp[depart_wp][2]
+        # Enter time
+        self.time_entered[mask_no_intention] = sim.simt
 
-        if self.mode != 'sim':
+        if self.mode != 'sim' and np.any(mask_no_intention):
             stack.stack(f"ECHO Aircrafts without intention are set to Departure. Target waypoint: {depart_wp}.")
 
 
@@ -789,7 +805,12 @@ class ApproachBS(core.Entity):
             msg += f"at {trk}/{alt}/{spd}/{gs}\t"
 
             # intention
-            msg += "ARR\t" if self.intention[acfidx] == 0 else "DEP\t"
+            if self.intention[acfidx] == 0:
+                msg += f"ARR to {self.wp_id[acfidx]}\t"
+            elif self.intention[acfidx] == 1:
+                msg += f"DEP to {self.wp_id[acfidx]}\t"
+            else:
+                msg += "N/A\t"
 
             # vector
             msg += "VEC\t" if self.radar_vector[acfidx] else "NAV\t"
@@ -815,7 +836,7 @@ class ApproachBS(core.Entity):
             return True 
 
 
-    def appbs_genrate(self, dep_rate: float=None, arr_rate: float=None):
+    def appbs_set_genrate(self, dep_rate: float=None, arr_rate: float=None):
         """ 
         Set the generation rate of departure and arrival aircrafts. 
         """
@@ -829,6 +850,31 @@ class ApproachBS(core.Entity):
         self.next_arr_gen_sep = self.next_dep_gen_sep = 0.0
 
         self.recent_arr_directions_max = int(arr_rate) + 1
+        return True
+
+
+    def appbs_los(self):
+        """
+        Show the current, one-minute, and three-minute loss of separation between aircrafts.
+        """
+        if self.mode == 'sim' or not self.tracon.is_active():
+            return True
+        
+        if self.conflict_one_minute.lospairs_unique:
+            stack.stack(f"ECHO Current LOS: {[tuple(pair) for pair in self.conflict_one_minute.lospairs_unique]}")
+        else:
+            stack.stack(f"ECHO Current LOS: None")
+
+        if self.conflict_one_minute.confpairs_unique:
+            stack.stack(f"ECHO LOS in 1 minute: {[tuple(pair) for pair in self.conflict_one_minute.confpairs_unique]}")
+        else:
+            stack.stack(f"ECHO LOS in 1 minute: None")
+
+        if self.conflict_three_minute.confpairs_unique:
+            stack.stack(f"ECHO LOS in 3 minutes: {[tuple(pair) for pair in self.conflict_three_minute.confpairs_unique]}")
+        else:
+            stack.stack(f"ECHO LOS in 3 minutes: None")
+
         return True
 
 
