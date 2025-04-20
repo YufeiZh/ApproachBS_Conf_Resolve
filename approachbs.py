@@ -94,22 +94,15 @@ class ApproachBS(core.Entity):
         self.mode = 'default'         # Simulation mode: default, debug, or sim
         
         # Simulator settings
-        stack.stack("ASAS ON")
+        if self.mode == 'default':
+            stack.stack("ASAS ON")
 
         # Tracon
         self.tracon = Tracon()
 
         # Conflict detectors
         # Conflict in one minute
-        self.conflict_one_minute = MyConflictDetection()
-        self.conflict_one_minute.rpz_def = 5.0 * nm  # Horizontal separation [m]
-        self.conflict_one_minute.hpz_def = 1000.0 * ft  # Vertical separation [m]
-        self.conflict_one_minute.dtlookahead_def = 60.0  # Lookahead time [s]
-        # Conflict in three minutes
-        self.conflict_three_minute = MyConflictDetection()
-        self.conflict_three_minute.rpz_def = 5.0 * nm  # Horizontal separation [m]
-        self.conflict_three_minute.hpz_def = 1000.0 * ft  # Vertical separation [m]
-        self.conflict_three_minute.dtlookahead_def = 180.0  # Lookahead time [s]
+        self.conflict_detector = MyConflictDetection()
 
         with self.settrafarrays():
 
@@ -406,7 +399,7 @@ class ApproachBS(core.Entity):
 
         # Update conflict detectors
         if self.confinvasion_timer.readynext() and self.tracon.is_active():
-            self.update_conflict_detectors()
+            self.update_conflict_detector()
             self.update_invasions()
 
         # Generate departure aircrafts
@@ -515,12 +508,10 @@ class ApproachBS(core.Entity):
             i += 1
 
 
-    def update_conflict_detectors(self):
+    def update_conflict_detector(self):
         ''' This function gets called automatically every 0.5 second if the airspace is active. '''
         # Check for conflicts in one minute
-        self.conflict_one_minute.update(traf, traf)
-        # Check for conflicts in three minutes
-        self.conflict_three_minute.update(traf, traf)
+        self.conflict_detector.update(traf, traf)
 
 
     def appbs_predict(self):
@@ -866,18 +857,18 @@ class ApproachBS(core.Entity):
         if self.mode == 'sim' or not self.tracon.is_active():
             return True
         
-        if self.conflict_one_minute.lospairs_unique:
+        if self.conflict_detector.lospairs_unique:
             stack.stack(f"ECHO Current LOS: {[tuple(pair) for pair in self.conflict_one_minute.lospairs_unique]}")
         else:
             stack.stack(f"ECHO Current LOS: None")
 
-        if self.conflict_one_minute.confpairs_unique:
-            stack.stack(f"ECHO LOS in 1 minute: {[tuple(pair) for pair in self.conflict_one_minute.confpairs_unique]}")
+        if self.conflict_detector.conf_one_minute_unique:
+            stack.stack(f"ECHO LOS in 1 minute: {[tuple(pair) for pair in self.conflict_detector.conf_one_minute_unique]}")
         else:
             stack.stack(f"ECHO LOS in 1 minute: None")
 
-        if self.conflict_three_minute.confpairs_unique:
-            stack.stack(f"ECHO LOS in 3 minutes: {[tuple(pair) for pair in self.conflict_three_minute.confpairs_unique]}")
+        if self.conflict_detector.conf_three_minute_unique:
+            stack.stack(f"ECHO LOS in 3 minutes: {[tuple(pair) for pair in self.conflict_detector.conf_three_minute_unique]}")
         else:
             stack.stack(f"ECHO LOS in 3 minutes: None")
 
@@ -888,7 +879,225 @@ class ApproachBS(core.Entity):
         stack.stack(f"ECHO {id(self.conflict_one_minute.dtlookahead_def)}, {id(self.conflict_three_minute.dtlookahead_def)}, {id(traf.cd)}")
 
 
-class MyConflictDetection(ConflictDetection):
+class MyConflictDetection(core.Entity, replaceable=False):
+    """
+    Override the ConflictDetection class to simultaneously detect conflicts in one minute and three minutes.
+    """
+    def __init__(self):
+        super().__init__()
+        ## Default values
+        # [m] Horizontal separation minimum for detection
+        self.rpz = 5.0 * nm
+        # [m] Vertical separation minimum for detection
+        self.hpz = 1000 * ft
+
+        # Current LoS
+        self.lospairs = list()
+        self.lospairs_unique = set()
+        self.lospairs_all = list()              # All LoS since beginning
+
+        # Conflicts in one minute
+        self.conf_one_minute = list()
+        self.qdr_one_minute = np.array([])
+        self.dist_one_minute = np.array([])
+        self.dcpa_one_minute = np.array([])
+        self.tcpa_one_minute = np.array([])
+        self.tLOS_one_minute = np.array([])
+        self.conf_one_minute_unique = set()
+        self.conf_one_minute_all = list()       # All conflicts (one minute) since beginning
+
+        # Conflicts in three minutes
+        self.conf_three_minute = list()
+        self.qdr_three_minute = np.array([])
+        self.dist_three_minute = np.array([])
+        self.dcpa_three_minute = np.array([])
+        self.tcpa_three_minute = np.array([])
+        self.tLOS_three_minute = np.array([])
+        self.conf_three_minute_unique = set()
+        self.conf_three_minute_all = list()     # All conflicts (three minutes) since beginning
+
+        # Per-aircraft conflict data
+        with self.settrafarrays():
+            self.inconf_one_minute = np.array([], dtype=bool)  # In-conflict flag
+            self.tcpamax_one_minute = np.array([]) # Maximum time to CPA for aircraft in conflict
+            self.inconf_three_minute = np.array([], dtype=bool)  # In-conflict flag
+            self.tcpamax_three_minute = np.array([]) # Maximum time to CPA for aircraft in conflict
+
+
+    def clearconfdb(self):
+        """ Clear the conflict database. """
+        self.lospairs_unique.clear()
+        self.lospairs.clear()
+        self.conf_one_minute_unique.clear()
+        self.conf_one_minute.clear()
+        self.conf_three_minute_unique.clear()
+        self.conf_three_minute.clear()
+
+        self.qdr_one_minute = np.array([])
+        self.dist_one_minute = np.array([])
+        self.dcpa_one_minute = np.array([])
+        self.tcpa_one_minute = np.array([])
+        self.tLOS_one_minute = np.array([])
+        
+        self.qdr_three_minute = np.array([])
+        self.dist_three_minute = np.array([])
+        self.dcpa_three_minute = np.array([])
+        self.tcpa_three_minute = np.array([])
+        self.tLOS_three_minute = np.array([])
+
+        self.inconf_one_minute = np.zeros(traf.ntraf, dtype=bool)
+        self.tcpamax_one_minute = np.zeros(traf.ntraf)
+        self.inconf_three_minute = np.zeros(traf.ntraf, dtype=bool)
+        self.tcpamax_three_minute = np.zeros(traf.ntraf)
+
+    
+    def create(self, n):
+        super().create(n)
+
+
+    def reset(self):
+        super().reset()
+        self.clearconfdb()
+        self.lospairs_all.clear()
+        self.conf_one_minute_all.clear()
+        self.conf_three_minute_all.clear()
+
+
+    def update(self, ownship, intruder):
+        ''' Update the conflicts. '''
+        if ownship.ntraf == 0 or intruder.ntraf == 0:
+            self.lospairs_unique.clear()
+            self.conf_one_minute_unique.clear()
+            self.conf_three_minute_unique.clear()
+            return
+        self.conf_one_minute, self.lospairs, self.inconf_one_minute, self.tcpamax_one_minute, self.qdr_one_minute, \
+            self.dist_one_minute, self.dcpa_one_minute, self.tcpa_one_minute, self.tLOS_one_minute = \
+                self.detect(ownship, intruder, self.rpz, self.hpz, 60.0)
+        
+        self.conf_three_minute, _, self.inconf_three_minute, self.tcpamax_three_minute, self.qdr_three_minute, \
+            self.dist_three_minute, self.dcpa_three_minute, self.tcpa_three_minute, self.tLOS_three_minute = \
+                self.detect(ownship, intruder, self.rpz, self.hpz, 180.0)
+
+        # confpairs has conflicts observed from both sides (a, b) and (b, a)
+        # confpairs_unique keeps only one of these
+        lospairs_unique = {frozenset(pair) for pair in self.lospairs}
+        conf_one_minute_unique = {frozenset(pair) for pair in self.conf_one_minute}
+        conf_three_minute_unique = {frozenset(pair) for pair in self.conf_three_minute}
+
+        self.lospairs_all.extend(lospairs_unique - self.lospairs_unique)
+        self.conf_one_minute_all.extend(conf_one_minute_unique - self.conf_one_minute_unique)
+        self.conf_three_minute_all.extend(conf_three_minute_unique - self.conf_three_minute_unique)
+
+        # Update confpairs_unique and lospairs_unique
+        self.lospairs_unique = lospairs_unique
+        self.conf_one_minute_unique = conf_one_minute_unique
+        self.conf_three_minute_unique = conf_three_minute_unique
+
+    
+    def detect(self, ownship, intruder, rpz, hpz, dtlookahead_def):
+        ''' State-based conflict detection. Copied from the original code. '''
+        # Expand rpz, hpz, dtlookahead to an array
+        rpz = np.full(ownship.ntraf, rpz, dtype=float)
+        hpz = np.full(ownship.ntraf, hpz, dtype=float)
+        dtlookahead = np.full(ownship.ntraf, dtlookahead_def, dtype=float)
+        # Identity matrix of order ntraf: avoid ownship-ownship detected conflicts
+        I = np.eye(ownship.ntraf)
+
+        # Horizontal conflict ------------------------------------------------------
+
+        # qdrlst is for [i,j] qdr from i to j, from perception of ADSB and own coordinates
+        qdr, dist = kwikqdrdist_matrix(np.asmatrix(ownship.lat), np.asmatrix(ownship.lon),
+                                    np.asmatrix(intruder.lat), np.asmatrix(intruder.lon))
+
+        # Convert back to array to allow element-wise array multiplications later on
+        # Convert to meters and add large value to own/own pairs
+        qdr = np.asarray(qdr)
+        dist = np.asarray(dist) * nm + 1e9 * I
+
+        # Calculate horizontal closest point of approach (CPA)
+        qdrrad = np.radians(qdr)
+        dx = dist * np.sin(qdrrad)  # is pos j rel to i
+        dy = dist * np.cos(qdrrad)  # is pos j rel to i
+
+        # Ownship track angle and speed
+        owntrkrad = np.radians(ownship.trk)
+        ownu = ownship.gs * np.sin(owntrkrad).reshape((1, ownship.ntraf))  # m/s
+        ownv = ownship.gs * np.cos(owntrkrad).reshape((1, ownship.ntraf))  # m/s
+
+        # Intruder track angle and speed
+        inttrkrad = np.radians(intruder.trk)
+        intu = intruder.gs * np.sin(inttrkrad).reshape((1, ownship.ntraf))  # m/s
+        intv = intruder.gs * np.cos(inttrkrad).reshape((1, ownship.ntraf))  # m/s
+
+        du = ownu - intu.T  # Speed du[i,j] is perceived eastern speed of i to j
+        dv = ownv - intv.T  # Speed dv[i,j] is perceived northern speed of i to j
+
+        dv2 = du * du + dv * dv
+        dv2 = np.where(np.abs(dv2) < 1e-6, 1e-6, dv2)  # limit lower absolute value
+        vrel = np.sqrt(dv2)
+
+        tcpa = -(du * dx + dv * dy) / dv2 + 1e9 * I
+
+        # Calculate distance^2 at CPA (minimum distance^2)
+        dcpa2 = np.abs(dist * dist - tcpa * tcpa * dv2)
+
+        # Check for horizontal conflict
+        # RPZ can differ per aircraft, get the largest value per aircraft pair
+        rpz = np.asarray(np.maximum(np.asmatrix(rpz), np.asmatrix(rpz).transpose()))
+        R2 = rpz * rpz
+        swhorconf = dcpa2 < R2  # conflict or not
+
+        # Calculate times of entering and leaving horizontal conflict
+        dxinhor = np.sqrt(np.maximum(0., R2 - dcpa2))  # half the distance travelled inzide zone
+        dtinhor = dxinhor / vrel
+
+        tinhor = np.where(swhorconf, tcpa - dtinhor, 1e8)  # Set very large if no conf
+        touthor = np.where(swhorconf, tcpa + dtinhor, -1e8)  # set very large if no conf
+
+        # Vertical conflict --------------------------------------------------------
+
+        # Vertical crossing of disk (-dh,+dh)
+        dalt = ownship.alt.reshape((1, ownship.ntraf)) - \
+            intruder.alt.reshape((1, ownship.ntraf)).T  + 1e9 * I
+
+        dvs = ownship.vs.reshape(1, ownship.ntraf) - \
+            intruder.vs.reshape(1, ownship.ntraf).T
+        dvs = np.where(np.abs(dvs) < 1e-6, 1e-6, dvs)  # prevent division by zero
+
+        # Check for passing through each others zone
+        # hPZ can differ per aircraft, get the largest value per aircraft pair
+        hpz = np.asarray(np.maximum(np.asmatrix(hpz), np.asmatrix(hpz).transpose()))
+        tcrosshi = (dalt + hpz) / -dvs
+        tcrosslo = (dalt - hpz) / -dvs
+        tinver = np.minimum(tcrosshi, tcrosslo)
+        toutver = np.maximum(tcrosshi, tcrosslo)
+
+        # Combine vertical and horizontal conflict----------------------------------
+        tinconf = np.maximum(tinver, tinhor)
+        toutconf = np.minimum(toutver, touthor)
+
+        swconfl = np.array(swhorconf * (tinconf <= toutconf) * (toutconf > 0.0) *
+                           np.asarray(tinconf < np.asmatrix(dtlookahead).T) * (1.0 - I), dtype=bool)
+
+        # --------------------------------------------------------------------------
+        # Update conflict lists
+        # --------------------------------------------------------------------------
+        # Ownship conflict flag and max tCPA
+        inconf = np.any(swconfl, 1)
+        tcpamax = np.max(tcpa * swconfl, 1)
+
+        # Select conflicting pairs: each a/c gets their own record
+        confpairs = [(ownship.id[i], ownship.id[j]) for i, j in zip(*np.where(swconfl))]
+        swlos = (dist < rpz) * (np.abs(dalt) < hpz)
+        lospairs = [(ownship.id[i], ownship.id[j]) for i, j in zip(*np.where(swlos))]
+
+        return confpairs, lospairs, inconf, tcpamax, \
+            qdr[swconfl], dist[swconfl], np.sqrt(dcpa2[swconfl]), \
+                tcpa[swconfl], tinconf[swconfl]
+
+
+# To deprecate
+class MyConflictDetection_deprecated(ConflictDetection):
     """
     Custom conflict detection class for TRACON operations.
     """
