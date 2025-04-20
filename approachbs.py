@@ -73,6 +73,12 @@ def init_plugin():
             '',
             approach_bs.appbs_los,
             'Display Loss of Separation.'
+        ],
+        'APPBS_DEBUG': [
+            'APPBS_DEBUG',
+            '',
+            approach_bs.appbs_debug,
+            'Debug'
         ]
     }
     
@@ -878,6 +884,10 @@ class ApproachBS(core.Entity):
         return True
 
 
+    def appbs_debug(self):
+        stack.stack(f"ECHO {id(self.conflict_one_minute.dtlookahead_def)}, {id(self.conflict_three_minute.dtlookahead_def)}, {id(traf.cd)}")
+
+
 class MyConflictDetection(ConflictDetection):
     """
     Custom conflict detection class for TRACON operations.
@@ -886,6 +896,49 @@ class MyConflictDetection(ConflictDetection):
     def __init__(self):
         super().__init__()
         self.use_global_asas_setting = False
+        # One minute conflict
+        self.conf_one_minute = list()
+        self.qdr_one_minute = np.array([])
+        self.dist_one_minute = np.array([])
+        self.dcpa_one_minute = np.array([])
+        self.tcpa_one_minute = np.array([])
+        self.tLOS_one_minute = np.array([])
+        self.conf_one_minute_unique = set()
+        self.conf_one_minute_all = list()
+        # Three minute conflict
+        self.conf_three_minute = list()
+        self.qdr_three_minute = np.array([])
+        self.dist_three_minute = np.array([])
+        self.dcpa_three_minute = np.array([])
+        self.tcpa_three_minute = np.array([])
+        self.tLOS_three_minute = np.array([])
+        self.conf_three_minute_unique = set()
+        self.conf_three_minute_all = list()
+
+
+    def clearconfdb(self):
+        """ Clear the conflict database. """
+        self.confpairs_unique.clear()
+        self.lospairs_unique.clear()
+        self.confpairs.clear()
+        self.lospairs.clear()
+
+        self.conf_one_minute.clear()
+        self.qdr_one_minute = np.array([])
+        self.dist_one_minute = np.array([])
+        self.dcpa_one_minute = np.array([])
+        self.tcpa_one_minute = np.array([])
+        self.tLOS_one_minute = np.array([])
+
+        self.conf_three_minute.clear()
+        self.qdr_three_minute = np.array([])
+        self.dist_three_minute = np.array([])
+        self.dcpa_three_minute = np.array([])
+        self.tcpa_three_minute = np.array([])
+        self.tLOS_three_minute = np.array([])
+
+        self.inconf = np.zeros(traf.ntraf)
+        self.tcpamax = np.zeros(traf.ntraf)
 
 
     def reset(self):
@@ -897,6 +950,8 @@ class MyConflictDetection(ConflictDetection):
         self.clearconfdb()
         self.confpairs_all.clear()
         self.lospairs_all.clear()
+        self.conf_one_minute_all.clear()
+        self.conf_three_minute_all.clear()
 
 
     @staticmethod
@@ -926,16 +981,14 @@ class MyConflictDetection(ConflictDetection):
 
 
     def update(self, ownship, intruder):
-        ''' Custom update step to handle zero-aircraft case. '''
+        ''' Update the conflicts. '''
         if ownship.ntraf == 0 or intruder.ntraf == 0:
-            self.confpairs_all.clear()
-            self.lospairs_all.clear()
             self.confpairs_unique.clear()
             self.lospairs_unique.clear()
             return
-        self.confpairs, self.lospairs, self.inconf, self.tcpamax, self.qdr, \
+        self.conf_one_minute, self.lospairs, self.inconf, self.tcpamax, self.qdr, \
             self.dist, self.dcpa, self.tcpa, self.tLOS = \
-                self.detect(ownship, intruder, self.rpz, self.hpz, self.dtlookahead)
+                self.detect(ownship, intruder, self.rpz, self.hpz, self.dtlookahead_def)
 
         # confpairs has conflicts observed from both sides (a, b) and (b, a)
         # confpairs_unique keeps only one of these
@@ -950,8 +1003,10 @@ class MyConflictDetection(ConflictDetection):
         self.lospairs_unique = lospairs_unique
 
 
-    def detect(self, ownship, intruder, rpz, hpz, dtlookahead):
+    def detect(self, ownship, intruder, rpz, hpz, dtlookahead_def):
         ''' State-based conflict detection. Copied from the original code. '''
+        # Expand dtlookahead to an array
+        dtlookahead = np.full(ownship.ntraf, dtlookahead_def, dtype=float)
         # Identity matrix of order ntraf: avoid ownship-ownship detected conflicts
         I = np.eye(ownship.ntraf)
 
