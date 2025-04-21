@@ -1127,6 +1127,81 @@ class MyConflictDetection(core.Entity, replaceable=False):
                 tcpa[swconfl], tinconf[swconfl]
 
 
+class InvasionDetection(core.Entity, replaceable=False):
+
+    def __init__(self):
+        # Dictionaries mapping area IDs to a list of invaded aircraft IDs.
+        self.current_invasion = dict()
+        self.one_minute_invasion = dict()
+        self.three_minute_invasion = dict()
+
+        with self.settrafarrays():
+            self.acf_invasion_flag = np.zeros([], dtype=bool)  # Invasion flag (current)
+            self.acf_invasion_flag_one_minute = np.zeros([], dtype=bool)  # Invasion flag (one minute)
+            self.acf_invasion_flag_three_minute = np.zeros([], dtype=bool)  # Invasion flag (three minutes)
+
+    def reset(self):
+        super().reset()
+
+        self.current_invasion = dict()
+        self.one_minute_invasion = dict()
+        self.three_minute_invasion = dict()
+
+    def check_invasion(self, tracon):
+        """
+        Check current area invasion.
+        Update self.current_invasion and self.acf_invasion_flag.
+        """
+        self.current_invasion = dict()
+        # No restricted area or no aircrafts
+        if traf.ntraf == 0 or not tracon.restrict:
+            return
+        
+        # Iterate through areas
+        for area_id in tracon.restrict:
+            inside_flag = checkInside(area_id, traf.lat, traf.lon, traf.alt / ft)
+            self.acf_invasion_flag[inside_flag] = True
+            self.current_invasion[area_id] = list(traf.id[inside_flag])
+
+
+    def check_invasion_one_minute(self, tracon):
+        """
+        Check area invasion in one minute.
+        Update self.one_minute_invasion and self.acf_invasion_flag_one_minute.
+        """
+        # later
+        pass
+
+
+    def check_invasion_three_minute(self, tracon):
+        """
+        Check area invasion in three minutes.
+        Update self.three_minute_invasion and self.acf_invasion_flag_three_minute.
+        """
+        # later
+        pass
+
+
+    def invasion_circle(self, dtlookahead, area_args):
+        """
+        Predict the invasion of a circular area.
+        """
+        # No aircrafts
+        if traf.ntraf == 0:
+            return
+        
+        bottom, top, ctr_lat, ctr_lon, radius = area_args
+
+        # Ray endpoints
+        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / ft)
+        end_alt = traf.alt + traf.vs * dtlookahead  # in meters
+        ray = np.array([[traf.lat, traf.lon], [end_lat, end_lon]])
+        ray
+
+        # calculate the projection (of the startpoint-center vector) vector on the ray vector
+        t = np.dot()
+
+
 class Tracon:
     """
     The class representing TRACON airspace.
@@ -1149,7 +1224,7 @@ class Tracon:
         arr_rwy_id: Dictionary mapping airport IDs to list of open arrival runway IDs, e.g., ["KSFO": ["28L", "28R"], "KSJC": ["30R"]]
         depart_wp: Dictionary mapping departure waypoint IDs to an ndarray [lat, lon, alt], 
             e.g., {"EAONE": ndarray([33.8744, -83.8000, 10000]), "WEONE": ndarray([33.52569, -85.1224, 10000])}
-        restrict: Dictionary mapping restricted area IDs to an ndarray of length 20
+        restrict: Dictionary mapping restricted area IDs to an ndarray of length 6 to 19
     """
     
     def __init__(self):
