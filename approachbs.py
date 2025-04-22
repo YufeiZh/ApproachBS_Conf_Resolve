@@ -1147,6 +1147,24 @@ class InvasionDetection(core.Entity, replaceable=False):
         self.one_minute_invasion = dict()
         self.three_minute_invasion = dict()
 
+
+    def create(self, n):
+        super().create(n)
+        self.acf_invasion_flag[-n:] = False
+        self.acf_invasion_flag_one_minute[-n:] = False
+        self.acf_invasion_flag_three_minute[-n:] = False
+
+    
+    def update(self, tracon):
+        """
+        Update the area invasion status of aircrafts.
+        """
+        # Check current area invasion
+        self.check_invasion(tracon)
+        # Check one-minute and three-minute area invasion
+        self.predict_invasions(tracon)
+
+
     def check_invasion(self, tracon):
         """
         Check current area invasion.
@@ -1164,42 +1182,116 @@ class InvasionDetection(core.Entity, replaceable=False):
             self.current_invasion[area_id] = list(traf.id[inside_flag])
 
 
-    def check_invasion_one_minute(self, tracon):
+    def predict_invasions(self, tracon):
         """
-        Check area invasion in one minute.
-        Update self.one_minute_invasion and self.acf_invasion_flag_one_minute.
+        Check area invasion.
+        Update self.one_minute_invasion, self.acf_invasion_flag_one_minute, self.three_minute_invasion, self.acf_invasion_flag_three_minute.
         """
-        # later
-        pass
-
-
-    def check_invasion_three_minute(self, tracon):
-        """
-        Check area invasion in three minutes.
-        Update self.three_minute_invasion and self.acf_invasion_flag_three_minute.
-        """
-        # later
-        pass
+        self.one_minute_invasion = dict()
+        self.three_minute_invasion = dict()
+        self.acf_invasion_flag_one_minute = np.zeros(traf.ntraf, dtype=bool)  # Invasion flag (one minute)
+        self.acf_invasion_flag_three_minute = np.zeros(traf.ntraf, dtype=bool)  # Invasion flag (three minutes)
+        if traf.ntraf == 0 or not tracon.restrict:
+            return
+        
+        # Iterate through areas
+        for area_id in tracon.restrict:
+            if tracon.restrict[area_id][0] == 0.0:
+                # Circular area
+                area_args = tracon.restrict[area_id][1:]
+                inside_flag_one_minute = self.invasion_circle(60.0, area_args)
+                inside_flag_three_minute = self.invasion_circle(180.0, area_args)
+            else:
+                # Polygonal area
+                area_args = tracon.restrict[area_id][1:]
+                inside_flag_one_minute = self.invasion_polygon(60.0, area_args)
+                inside_flag_three_minute = self.invasion_polygon(180.0, area_args)
+            
+            self.acf_invasion_flag_one_minute[inside_flag_one_minute] = True
+            self.one_minute_invasion[area_id] = list(traf.id[inside_flag_one_minute])
+            self.acf_invasion_flag_three_minute[inside_flag_three_minute] = True
+            self.three_minute_invasion[area_id] = list(traf.id[inside_flag_three_minute])
 
 
     def invasion_circle(self, dtlookahead, area_args):
         """
         Predict the invasion of a circular area.
         """
-        # No aircrafts
-        if traf.ntraf == 0:
-            return
         
         bottom, top, ctr_lat, ctr_lon, radius = area_args
 
         # Ray endpoints
-        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / ft)
-        end_alt = traf.alt + traf.vs * dtlookahead  # in meters
-        ray = np.array([[traf.lat, traf.lon], [end_lat, end_lon]])
-        ray
+        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / nm)
+
+        # Vectors
+        startpoints = np.stack([traf.lat, traf.lon], axis=1)
+        endpoints = np.stack([end_lat, end_lon], axis=1)
+        seg_vectors = endpoints - startpoints       # Vectors from start to end point
+        seg_vec_norm = np.linalg.norm(seg_vectors, axis=1)      # Norm of the vectors
 
         # calculate the projection (of the startpoint-center vector) vector on the ray vector
-        t = np.dot()
+        start_center_vecs = np.array([[ctr_lat, ctr_lon]]) - startpoints
+        t_close = np.einsum('ij,ij->i', seg_vectors, start_center_vecs) / seg_vec_norm**2
+        t_clamped = np.clip(t_close, 0, 1)  # Clamp t to [0, 1]
+        closest_points = startpoints + t_clamped[:, np.newaxis] * seg_vectors  # Closest points on the segment to the center of the area
+        _, distance = qdrdist(closest_points[:, 0], closest_points[:, 1], ctr_lat, ctr_lon)
+        # Check if the closest point is within the radius of the area
+        inside_flag = distance < radius
+        # Get t_in and t_out
+        virtual_closest = startpoints + t_close[:, np.newaxis] * seg_vectors
+        _, virtual_distance = qdrdist(virtual_closest[:, 0], virtual_closest[:, 1], ctr_lat, ctr_lon)
+        # Use Pythagorean
+        _, dist_start_virtual = qdrdist(traf.lat, traf.lon, virtual_closest[:, 0], virtual_closest[:, 1])
+        delta_t = np.where(inside_flag, np.sqrt(radius**2 - virtual_distance**2) / dist_start_virtual * t_close, -1)
+        t_in = np.where(inside_flag, t_close - delta_t, -1)
+        t_out = np.where(inside_flag, t_close + delta_t, -1)
+        t_in[inside_flag] = np.clip(t_in[inside_flag], 0, 1)    # Clamp to [0, 1]
+        t_out[inside_flag] = np.clip(t_out[inside_flag], 0, 1)  # Clamp to [0, 1]
+        # Get the altitude at t_in and t_out
+        alt_in = np.where(inside_flag, (traf.alt + traf.vs * t_in * dtlookahead) / ft, -1)
+        alt_out = np.where(inside_flag, (traf.alt + traf.vs * t_out * dtlookahead) / ft, -1)
+        # Check if the aircraft enters or crosses the area
+        below_in = alt_in[inside_flag] < bottom
+        above_in = alt_in[inside_flag] > top
+        below_out = alt_out[inside_flag] < bottom
+        above_out = alt_out[inside_flag] > top
+        not_crossing = (below_in & below_out) | (above_in & above_out)
+        inside_flag[inside_flag] = ~not_crossing
+
+        return inside_flag
+    
+
+    def invasion_polygon(self, dtlookahead, area_args):
+        """
+        Predict the invasion of a polygonal area.
+        Use a simplified model: only consider the start and end altitude.
+        """
+        
+        bottom, top = area_args[:2]
+        vertices = area_args[2:]
+        area_path = Path(vertices.reshape(-1, 2))
+
+        # Ray endpoints
+        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / nm)
+        end_alt = (traf.alt + traf.vs * dtlookahead) / ft
+
+        # Vectors
+        startpoints = np.stack([traf.lat, traf.lon], axis=1)
+        endpoints = np.stack([end_lat, end_lon], axis=1)
+        segments = np.stack([startpoints, endpoints], axis=1)   # Shape (ntraf, 2, 2)
+        seg_paths = [Path(seg) for seg in segments]             # List of Path objects
+
+        # intersect
+        inside_flag = np.array([path.intersects_path(area_path) for path in seg_paths], dtype=bool)
+        # Check if the aircraft is within the altitude range
+        below_in = (traf.alt / ft) < bottom
+        above_in = (traf.alt / ft) > top
+        below_out = end_alt < bottom
+        above_out = end_alt > top
+        not_crossing = (below_in & below_out) | (above_in & above_out)
+        inside_flag[inside_flag] = ~not_crossing[inside_flag]
+
+        return inside_flag
 
 
 class Tracon:
