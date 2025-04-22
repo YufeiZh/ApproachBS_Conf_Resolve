@@ -106,9 +106,10 @@ class ApproachBS(core.Entity):
         # Tracon
         self.tracon = Tracon()
 
-        # Conflict detectors
-        # Conflict in one minute
+        # Conflict detector
         self.conflict_detector = MyConflictDetection()
+        # Invasion detector
+        self.invasion_detector = InvasionDetection()
 
         with self.settrafarrays():
 
@@ -140,20 +141,6 @@ class ApproachBS(core.Entity):
         # To monitor entering/leaving the airspace and vectoring status
         self.prev_under_ctrl = self.under_ctrl.copy()   # Previous under control status
         self.prev_radar_vector = self.radar_vector.copy()   # Previous radar vector status
-
-        # Predicted aircraft status
-        self.one_minute_lat = np.array([])  # Latitude of the aircraft in one minute [deg]
-        self.one_minute_lon = np.array([])  # Longitude of the aircraft in one minute [deg]
-        self.one_minute_alt = np.array([])  # Altitude of the aircraft in one minute [m]
-        self.three_minute_lat = np.array([])  # Latitude of the aircraft in three minutes [deg]
-        self.three_minute_lon = np.array([])  # Longitude of the aircraft in three minutes [deg]
-        self.three_minute_alt = np.array([])  # Altitude of the aircraft in three minutes [m]
-
-        # Area invasion
-        self.current_invasion = dict()  # Current area invasion status
-        self.one_minute_invasion = dict()  # One minute area invasion status
-        self.three_minute_invasion = dict()  # Three minute area invasion status
-
 
         # Aircraft generation settings
         self.auto_gen_setting = {
@@ -401,12 +388,11 @@ class ApproachBS(core.Entity):
         # Update aircraft status
         if self.update_timer.readynext() and self.tracon.is_active():
             self.appbs_update()
-            self.appbs_predict()
 
         # Update conflict detectors
         if self.confinvasion_timer.readynext() and self.tracon.is_active():
-            self.update_conflict_detector()
-            self.update_invasions()
+            self.conflict_detector.update(traf, traf)
+            self.invasion_detector.update(traf, self.tracon)
 
         # Generate departure aircrafts
         if self.tracon.is_active() and self.auto_gen_setting['dep_gen_rate'] > 0.0:
@@ -512,67 +498,6 @@ class ApproachBS(core.Entity):
                     traf.delete(i)
                     i -= 1
             i += 1
-
-
-    def update_conflict_detector(self):
-        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
-        # Check for conflicts in one minute
-        self.conflict_detector.update(traf, traf)
-
-
-    def appbs_predict(self):
-        """ 
-        Predict the aircraft status in one minute and three minutes. 
-        Update the following attributes:
-         one_minute_lat, one_minute_lon, one_minute_alt, three_minute_lat, three_minute_lon, three_minute_alt
-        State-based prediction (same logic as the conflict detection).
-        """
-        if not self.tracon.is_active():
-            return
-        
-        # Vertical prediction
-        self.one_minute_alt = traf.alt + traf.vs * 60.0
-        self.three_minute_alt = traf.alt + traf.vs * 180.0
-
-        # Horizontal prediction
-        one_minute_dist = traf.gs * 60.0
-        self.one_mniute_lat, self.one_minute_lon = qdrpos(traf.lat, traf.lon, traf.trk, one_minute_dist)
-        three_minute_dist = traf.gs * 180.0
-        self.three_minute_lat, self.three_minute_lon = qdrpos(traf.lat, traf.lon, traf.trk, three_minute_dist)
-
-
-    def update_invasions(self):
-        ''' This function gets called automatically every 0.5 second if the airspace is active. '''
-        # Update area invasion status
-        self.current_invasion = self.predict_invasion(traf.lat, traf.lon, traf.alt)
-        self.one_minute_invasion = self.predict_invasion(self.one_minute_lat, self.one_minute_lon, self.one_minute_alt)
-        self.three_minute_invasion = self.predict_invasion(self.three_minute_lat, self.three_minute_lon, self.three_minute_alt)
-
-
-    def predict_invasion(self, lat, lon, alt):
-        """ 
-        Check area invasion based on input coordinates. 
-        Return a dictionary mapping aircraft IDs to a list of invaded area IDs.
-        """
-        new_invasion = dict()
-
-        # No restricted area or no aircrafts
-        if traf.ntraf == 0 or \
-            not self.tracon.restrict or \
-            not len(lat) == len(lon) == len(alt) == traf.ntraf:
-            return new_invasion
-        
-        # Iterate through areas
-        for area_id in self.tracon.restrict:
-            inside_flag = checkInside(area_id, lat, lon, alt / ft)
-            # Update the dictionary
-            for idx, inside in enumerate(inside_flag):
-                if inside:
-                    if traf.id[idx] not in new_invasion:
-                        new_invasion[traf.id[idx]] = []
-                    new_invasion[traf.id[idx]].append(area_id)
-        
-        return new_invasion
 
 
     def generate_dep_acf(self):
@@ -888,18 +813,18 @@ class ApproachBS(core.Entity):
         if self.mode == 'sim' or not self.tracon.is_active():
             return True
         
-        if self.current_invasion:
-            stack.stack(f"ECHO Current Invasion: {self.current_invasion}")
+        if self.invasion_detector.current_invasion:
+            stack.stack(f"ECHO Current Invasion: {self.invasion_detector.current_invasion}")
         else:
             stack.stack(f"ECHO Current Invasion: None")
 
-        if self.one_minute_invasion:
-            stack.stack(f"ECHO Invasion in 1 minute: {self.one_minute_invasion}")
+        if self.invasion_detector.one_minute_invasion:
+            stack.stack(f"ECHO Invasion in 1 minute: {self.invasion_detector.one_minute_invasion}")
         else:
             stack.stack(f"ECHO Invasion in 1 minute: None")
 
-        if self.three_minute_invasion:
-            stack.stack(f"ECHO Invasion in 3 minutes: {self.three_minute_invasion}")
+        if self.invasion_detector.three_minute_invasion:
+            stack.stack(f"ECHO Invasion in 3 minutes: {self.invasion_detector.three_minute_invasion}")
         else:
             stack.stack(f"ECHO Invasion in 3 minutes: None")
 
@@ -1140,6 +1065,7 @@ class InvasionDetection(core.Entity, replaceable=False):
             self.acf_invasion_flag_one_minute = np.zeros([], dtype=bool)  # Invasion flag (one minute)
             self.acf_invasion_flag_three_minute = np.zeros([], dtype=bool)  # Invasion flag (three minutes)
 
+
     def reset(self):
         super().reset()
 
@@ -1155,43 +1081,43 @@ class InvasionDetection(core.Entity, replaceable=False):
         self.acf_invasion_flag_three_minute[-n:] = False
 
     
-    def update(self, tracon):
+    def update(self, intruder, tracon):
         """
         Update the area invasion status of aircrafts.
         """
         # Check current area invasion
-        self.check_invasion(tracon)
+        self.check_invasion(intruder, tracon)
         # Check one-minute and three-minute area invasion
-        self.predict_invasions(tracon)
+        self.predict_invasions(intruder, tracon)
 
 
-    def check_invasion(self, tracon):
+    def check_invasion(self, intruder, tracon):
         """
         Check current area invasion.
         Update self.current_invasion and self.acf_invasion_flag.
         """
         self.current_invasion = dict()
         # No restricted area or no aircrafts
-        if traf.ntraf == 0 or not tracon.restrict:
+        if intruder.ntraf == 0 or not tracon.restrict:
             return
         
         # Iterate through areas
         for area_id in tracon.restrict:
-            inside_flag = checkInside(area_id, traf.lat, traf.lon, traf.alt / ft)
+            inside_flag = checkInside(area_id, intruder.lat, intruder.lon, intruder.alt / ft)
             self.acf_invasion_flag[inside_flag] = True
-            self.current_invasion[area_id] = list(traf.id[inside_flag])
+            self.current_invasion[area_id] = list(intruder.id[inside_flag])
 
 
-    def predict_invasions(self, tracon):
+    def predict_invasions(self, intruder, tracon):
         """
         Check area invasion.
         Update self.one_minute_invasion, self.acf_invasion_flag_one_minute, self.three_minute_invasion, self.acf_invasion_flag_three_minute.
         """
         self.one_minute_invasion = dict()
         self.three_minute_invasion = dict()
-        self.acf_invasion_flag_one_minute = np.zeros(traf.ntraf, dtype=bool)  # Invasion flag (one minute)
-        self.acf_invasion_flag_three_minute = np.zeros(traf.ntraf, dtype=bool)  # Invasion flag (three minutes)
-        if traf.ntraf == 0 or not tracon.restrict:
+        self.acf_invasion_flag_one_minute = np.zeros(intruder.ntraf, dtype=bool)  # Invasion flag (one minute)
+        self.acf_invasion_flag_three_minute = np.zeros(intruder.ntraf, dtype=bool)  # Invasion flag (three minutes)
+        if intruder.ntraf == 0 or not tracon.restrict:
             return
         
         # Iterate through areas
@@ -1208,12 +1134,12 @@ class InvasionDetection(core.Entity, replaceable=False):
                 inside_flag_three_minute = self.invasion_polygon(180.0, area_args)
             
             self.acf_invasion_flag_one_minute[inside_flag_one_minute] = True
-            self.one_minute_invasion[area_id] = list(traf.id[inside_flag_one_minute])
+            self.one_minute_invasion[area_id] = list(intruder.id[inside_flag_one_minute])
             self.acf_invasion_flag_three_minute[inside_flag_three_minute] = True
-            self.three_minute_invasion[area_id] = list(traf.id[inside_flag_three_minute])
+            self.three_minute_invasion[area_id] = list(intruder.id[inside_flag_three_minute])
 
 
-    def invasion_circle(self, dtlookahead, area_args):
+    def invasion_circle(self, intruder, dtlookahead, area_args):
         """
         Predict the invasion of a circular area.
         """
@@ -1221,10 +1147,10 @@ class InvasionDetection(core.Entity, replaceable=False):
         bottom, top, ctr_lat, ctr_lon, radius = area_args
 
         # Ray endpoints
-        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / nm)
+        end_lat, end_lon = qdrpos(intruder.lat, intruder.lon, intruder.trk, intruder.gs * dtlookahead / nm)
 
         # Vectors
-        startpoints = np.stack([traf.lat, traf.lon], axis=1)
+        startpoints = np.stack([intruder.lat, intruder.lon], axis=1)
         endpoints = np.stack([end_lat, end_lon], axis=1)
         seg_vectors = endpoints - startpoints       # Vectors from start to end point
         seg_vec_norm = np.linalg.norm(seg_vectors, axis=1)      # Norm of the vectors
@@ -1237,31 +1163,29 @@ class InvasionDetection(core.Entity, replaceable=False):
         _, distance = qdrdist(closest_points[:, 0], closest_points[:, 1], ctr_lat, ctr_lon)
         # Check if the closest point is within the radius of the area
         inside_flag = distance < radius
-        # Get t_in and t_out
-        virtual_closest = startpoints + t_close[:, np.newaxis] * seg_vectors
+            # Get t_in and t_out
+        virtual_closest = startpoints[inside_flag] + t_close[inside_flag][:, np.newaxis] * seg_vectors[inside_flag]
         _, virtual_distance = qdrdist(virtual_closest[:, 0], virtual_closest[:, 1], ctr_lat, ctr_lon)
         # Use Pythagorean
-        _, dist_start_virtual = qdrdist(traf.lat, traf.lon, virtual_closest[:, 0], virtual_closest[:, 1])
-        delta_t = np.where(inside_flag, np.sqrt(radius**2 - virtual_distance**2) / dist_start_virtual * t_close, -1)
-        t_in = np.where(inside_flag, t_close - delta_t, -1)
-        t_out = np.where(inside_flag, t_close + delta_t, -1)
-        t_in[inside_flag] = np.clip(t_in[inside_flag], 0, 1)    # Clamp to [0, 1]
-        t_out[inside_flag] = np.clip(t_out[inside_flag], 0, 1)  # Clamp to [0, 1]
+        _, dist_start_virtual = qdrdist(intruder.lat[inside_flag], intruder.lon[inside_flag], virtual_closest[:, 0], virtual_closest[:, 1])
+        delta_t = np.sqrt(radius**2 - virtual_distance**2) / dist_start_virtual * t_close[inside_flag]
+        t_in = np.clip(t_close[inside_flag] - delta_t, 0, 1)    # Clamp to [0, 1]
+        t_out = np.clip(t_close[inside_flag] + delta_t, 0, 1)   # Clamp to [0, 1]
         # Get the altitude at t_in and t_out
-        alt_in = np.where(inside_flag, (traf.alt + traf.vs * t_in * dtlookahead) / ft, -1)
-        alt_out = np.where(inside_flag, (traf.alt + traf.vs * t_out * dtlookahead) / ft, -1)
+        alt_in = (intruder.alt[inside_flag] + intruder.vs[inside_flag] * t_in * dtlookahead) / ft
+        alt_out = (intruder.alt[inside_flag] + intruder.vs[inside_flag] * t_out * dtlookahead) / ft
         # Check if the aircraft enters or crosses the area
-        below_in = alt_in[inside_flag] < bottom
-        above_in = alt_in[inside_flag] > top
-        below_out = alt_out[inside_flag] < bottom
-        above_out = alt_out[inside_flag] > top
+        below_in = alt_in < bottom
+        above_in = alt_in > top
+        below_out = alt_out < bottom
+        above_out = alt_out > top
         not_crossing = (below_in & below_out) | (above_in & above_out)
         inside_flag[inside_flag] = ~not_crossing
 
         return inside_flag
     
 
-    def invasion_polygon(self, dtlookahead, area_args):
+    def invasion_polygon(self, intruder, dtlookahead, area_args):
         """
         Predict the invasion of a polygonal area.
         Use a simplified model: only consider the start and end altitude.
@@ -1272,11 +1196,11 @@ class InvasionDetection(core.Entity, replaceable=False):
         area_path = Path(vertices.reshape(-1, 2))
 
         # Ray endpoints
-        end_lat, end_lon = qdrpos(traf.lat, traf.lon, traf.trk, traf.gs * dtlookahead / nm)
-        end_alt = (traf.alt + traf.vs * dtlookahead) / ft
+        end_lat, end_lon = qdrpos(intruder.lat, intruder.lon, intruder.trk, intruder.gs * dtlookahead / nm)
+        end_alt = (intruder.alt + intruder.vs * dtlookahead) / ft
 
         # Vectors
-        startpoints = np.stack([traf.lat, traf.lon], axis=1)
+        startpoints = np.stack([intruder.lat, intruder.lon], axis=1)
         endpoints = np.stack([end_lat, end_lon], axis=1)
         segments = np.stack([startpoints, endpoints], axis=1)   # Shape (ntraf, 2, 2)
         seg_paths = [Path(seg) for seg in segments]             # List of Path objects
@@ -1284,8 +1208,8 @@ class InvasionDetection(core.Entity, replaceable=False):
         # intersect
         inside_flag = np.array([path.intersects_path(area_path) for path in seg_paths], dtype=bool)
         # Check if the aircraft is within the altitude range
-        below_in = (traf.alt / ft) < bottom
-        above_in = (traf.alt / ft) > top
+        below_in = (intruder.alt / ft) < bottom
+        above_in = (intruder.alt / ft) > top
         below_out = end_alt < bottom
         above_out = end_alt > top
         not_crossing = (below_in & below_out) | (above_in & above_out)
