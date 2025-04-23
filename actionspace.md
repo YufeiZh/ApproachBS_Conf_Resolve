@@ -7,8 +7,8 @@ Each action is an ATC command sent to an aircraft using the *stack commands* of 
 should be considered as one command (action).
 
 Assume from now on that:
-* We import `bluesky` as `bs` with the plugin `approachbs`.
-* We have `approach_bs = bs.plugins.approachbs.approach_bs`. 
+* We import `bluesky` as `bs` with the plugin `approachbs.py`.
+* We have `approach_bs = bs.plugins.approachbs.approach_bs`. This is how we access the additional attributes of the aircrafts.
 * For an aircraft with callsign `acid` (string), use `bs.traf.id2idx(acid)` to find its index.
 * A stack command `COMMAND` (string) can be sent via `bluesky.stack.stack(COMMAND)`.  
 
@@ -29,13 +29,13 @@ For an aircraft with callsign `acid` (string) and index `idx = bs.traf.id2idx(ac
 
 *The following instructions can be sent only if we decide to send a command which is not "direct to". In other words, if a "direct to" command is included, then the following instructions should not be included.*
 
-* **Change heading**: round to integers in $[0,359]$. To assign a heading `hdg`, use stack command
+* **Change heading**: round to integers (degree) in $[0,359]$. To assign a heading `hdg`, use stack command
     `HDG {acid}, {hdg}`.
 
 * **Change altitude**: round to $100$ feet, range from `approach_bs.tracon.bottom` to `approach_bs.tracon.top`. To assign an altitude `alt`, use stack command
     `ALT {acid}, {alt}`.
 
-* **Change speed**: round to integers in $[180, 250]$. To assign a speed `spd`, use stack command
+* **Change speed**: round to integers (knots) in $[160, 280]$. To assign a speed `spd`, use stack command
     `SPD {acid}, {spd}`.
 
 
