@@ -97,7 +97,7 @@ class ApproachBS(core.Entity):
     def __init__(self):
         super().__init__()
 
-        self.mode = 'debug'         # Simulation mode: default, debug, or sim
+        self.mode = 'default'         # Simulation mode: default, debug, or sim
         
         # Simulator settings
         if self.mode == 'default':
@@ -176,6 +176,7 @@ class ApproachBS(core.Entity):
         Create an aircraft. Provides stack command APPBS_CRE.
         This is the preferred method to create an aircraft in ApproachBS in place of CRE.
         """
+        acfid = acfid.upper()
 
         if not self.tracon.is_active():
             msg = f"Aircraft {acfid} is not created. The TRACON is not active."
