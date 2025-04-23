@@ -97,7 +97,7 @@ class ApproachBS(core.Entity):
     def __init__(self):
         super().__init__()
 
-        self.mode = 'default'         # Simulation mode: default, debug, or sim
+        self.mode = 'debug'         # Simulation mode: default, debug, or sim
         
         # Simulator settings
         if self.mode == 'default':
@@ -373,7 +373,7 @@ class ApproachBS(core.Entity):
         self.time_last_cmd[-n:] = -60.0
 
 
-    @core.timed_function(name='appbs_update_manager', dt=0.1)
+    @core.timed_function(name='appbs_update_manager', dt=0.05)
     def update(self):
         ''' This function gets called automatically every 0.1 second. '''
 
@@ -813,20 +813,48 @@ class ApproachBS(core.Entity):
         if self.mode == 'sim' or not self.tracon.is_active():
             return True
         
-        if self.invasion_detector.current_invasion:
-            stack.stack(f"ECHO Current Invasion: {self.invasion_detector.current_invasion}")
+        invasion_flag = False
+        msg = ""
+        for area, inva in self.invasion_detector.current_invasion.items():
+            if inva:
+                msg += f"{area}: {inva}, "
+                invasion_flag = True
+        if invasion_flag:
+            stack.stack("ECHO Current Invasion: ")
+            stack.stack(f"ECHO {msg}")
         else:
-            stack.stack(f"ECHO Current Invasion: None")
+            stack.stack("ECHO Current Invasion: None")
 
-        if self.invasion_detector.one_minute_invasion:
-            stack.stack(f"ECHO Invasion in 1 minute: {self.invasion_detector.one_minute_invasion}")
+        invasion_flag = False
+        msg = ""
+        for area, inva in self.invasion_detector.one_minute_invasion.items():
+            if inva:
+                msg += f"{area}: {inva}, "
+                invasion_flag = True
+        if invasion_flag:
+            stack.stack("ECHO Invasion in 1 minute: ")
+            stack.stack(f"ECHO {msg}")
         else:
-            stack.stack(f"ECHO Invasion in 1 minute: None")
+            stack.stack("ECHO Invasion in 1 minute: None")
+        
+        invasion_flag = False
+        msg = ""
+        for area, inva in self.invasion_detector.three_minute_invasion.items():
+            if inva:
+                msg += f"{area}: {inva}, "
+                invasion_flag = True
+        if invasion_flag:
+            stack.stack("ECHO Invasion in 3 minutes: ")
+            stack.stack(f"ECHO {msg}")
+        else:
+            stack.stack("ECHO Invasion in 3 minutes: None")
 
-        if self.invasion_detector.three_minute_invasion:
-            stack.stack(f"ECHO Invasion in 3 minutes: {self.invasion_detector.three_minute_invasion}")
-        else:
-            stack.stack(f"ECHO Invasion in 3 minutes: None")
+        
+        if self.mode == 'debug':
+            stack.stack(f"ECHO {self.invasion_detector.acf_invasion_flag}")
+            stack.stack(f"ECHO {self.invasion_detector.acf_invasion_flag_one_minute}")
+            stack.stack(f"ECHO {self.invasion_detector.acf_invasion_flag_three_minute}")
+
 
         return True
 
@@ -1055,15 +1083,16 @@ class MyConflictDetection(core.Entity, replaceable=False):
 class InvasionDetection(core.Entity, replaceable=False):
 
     def __init__(self):
+        super().__init__()
         # Dictionaries mapping area IDs to a list of invaded aircraft IDs.
         self.current_invasion = dict()
         self.one_minute_invasion = dict()
         self.three_minute_invasion = dict()
 
         with self.settrafarrays():
-            self.acf_invasion_flag = np.zeros([], dtype=bool)  # Invasion flag (current)
-            self.acf_invasion_flag_one_minute = np.zeros([], dtype=bool)  # Invasion flag (one minute)
-            self.acf_invasion_flag_three_minute = np.zeros([], dtype=bool)  # Invasion flag (three minutes)
+            self.acf_invasion_flag = np.array([], dtype=bool)  # Invasion flag (current)
+            self.acf_invasion_flag_one_minute = np.array([], dtype=bool)  # Invasion flag (one minute)
+            self.acf_invasion_flag_three_minute = np.array([], dtype=bool)  # Invasion flag (three minutes)
 
 
     def reset(self):
@@ -1097,6 +1126,7 @@ class InvasionDetection(core.Entity, replaceable=False):
         Update self.current_invasion and self.acf_invasion_flag.
         """
         self.current_invasion = dict()
+        self.acf_invasion_flag[:] = False
         # No restricted area or no aircrafts
         if intruder.ntraf == 0 or not tracon.restrict:
             return
@@ -1105,7 +1135,7 @@ class InvasionDetection(core.Entity, replaceable=False):
         for area_id in tracon.restrict:
             inside_flag = checkInside(area_id, intruder.lat, intruder.lon, intruder.alt / ft)
             self.acf_invasion_flag[inside_flag] = True
-            self.current_invasion[area_id] = list(intruder.id[inside_flag])
+            self.current_invasion[area_id] = [intruder.id[i] for i in range(intruder.ntraf) if inside_flag[i]]
 
 
     def predict_invasions(self, intruder, tracon):
@@ -1125,18 +1155,18 @@ class InvasionDetection(core.Entity, replaceable=False):
             if tracon.restrict[area_id][0] == 0.0:
                 # Circular area
                 area_args = tracon.restrict[area_id][1:]
-                inside_flag_one_minute = self.invasion_circle(60.0, area_args)
-                inside_flag_three_minute = self.invasion_circle(180.0, area_args)
+                inside_flag_one_minute = self.invasion_circle(intruder, 60.0, area_args)
+                inside_flag_three_minute = self.invasion_circle(intruder, 180.0, area_args)
             else:
                 # Polygonal area
                 area_args = tracon.restrict[area_id][1:]
-                inside_flag_one_minute = self.invasion_polygon(60.0, area_args)
-                inside_flag_three_minute = self.invasion_polygon(180.0, area_args)
+                inside_flag_one_minute = self.invasion_polygon(intruder, 60.0, area_args)
+                inside_flag_three_minute = self.invasion_polygon(intruder, 180.0, area_args)
             
             self.acf_invasion_flag_one_minute[inside_flag_one_minute] = True
-            self.one_minute_invasion[area_id] = list(intruder.id[inside_flag_one_minute])
+            self.one_minute_invasion[area_id] = [intruder.id[i] for i in range(intruder.ntraf) if inside_flag_one_minute[i]]
             self.acf_invasion_flag_three_minute[inside_flag_three_minute] = True
-            self.three_minute_invasion[area_id] = list(intruder.id[inside_flag_three_minute])
+            self.three_minute_invasion[area_id] = [intruder.id[i] for i in range(intruder.ntraf) if inside_flag_three_minute[i]]
 
 
     def invasion_circle(self, intruder, dtlookahead, area_args):
@@ -1206,7 +1236,7 @@ class InvasionDetection(core.Entity, replaceable=False):
         seg_paths = [Path(seg) for seg in segments]             # List of Path objects
 
         # intersect
-        inside_flag = np.array([path.intersects_path(area_path) for path in seg_paths], dtype=bool)
+        inside_flag = np.array([area_path.intersects_path(path) for path in seg_paths], dtype=bool)
         # Check if the aircraft is within the altitude range
         below_in = (intruder.alt / ft) < bottom
         above_in = (intruder.alt / ft) > top
