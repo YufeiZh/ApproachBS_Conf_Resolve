@@ -374,6 +374,13 @@ class ApproachBS(core.Entity):
         self.time_last_cmd[-n:] = -60.0
 
 
+    def reset(self):
+        super.reset()
+        # Reset additional attributes
+        # Later
+        pass
+
+
     @core.timed_function(name='appbs_update_manager', dt=0.05)
     def update(self):
         ''' This function gets called automatically every 0.1 second. '''
@@ -903,6 +910,7 @@ class MyConflictDetection(core.Entity, replaceable=False):
 
         # Per-aircraft conflict data
         with self.settrafarrays():
+            self.inlos = np.array([], dtype=bool)  # LoS flag
             self.inconf_one_minute = np.array([], dtype=bool)  # In-conflict flag
             self.tcpamax_one_minute = np.array([]) # Maximum time to CPA for aircraft in conflict
             self.inconf_three_minute = np.array([], dtype=bool)  # In-conflict flag
@@ -930,6 +938,7 @@ class MyConflictDetection(core.Entity, replaceable=False):
         self.tcpa_three_minute = np.array([])
         self.tLOS_three_minute = np.array([])
 
+        self.inlos = np.zeros(traf.ntraf, dtype=bool)
         self.inconf_one_minute = np.zeros(traf.ntraf, dtype=bool)
         self.tcpamax_one_minute = np.zeros(traf.ntraf)
         self.inconf_three_minute = np.zeros(traf.ntraf, dtype=bool)
@@ -977,6 +986,12 @@ class MyConflictDetection(core.Entity, replaceable=False):
         self.lospairs_unique = lospairs_unique
         self.conf_one_minute_unique = conf_one_minute_unique
         self.conf_three_minute_unique = conf_three_minute_unique
+
+        # Update los_flag
+        self.inlos[:] = False
+        for acf1, acf2 in self.lospairs_unique:
+            self.inlos[traf.id2idx(acf1)] = True
+            self.inlos[traf.id2idx(acf2)] = True
 
     
     def detect(self, ownship, intruder, rpz, hpz, dtlookahead_def):
