@@ -168,7 +168,7 @@ class RewardFunction:
             reward_components["self_nav"] = self._calculate_self_nav_reward(i, acid, approach_bs, actions)
             
             # D8: Sharp turns
-            reward_components["sharp_turns"] = self._calculate_sharp_turns_reward(i, acid, traf, approach_bs, actions)
+            reward_components["sharp_turns"] = self._calculate_sharp_turns_reward(i, acid, traf, actions)
             
             # D9: Inappropriate altitude changes
             reward_components["altitude"] = self._calculate_altitude_reward(i, acid, traf, approach_bs, actions)
@@ -382,7 +382,7 @@ class RewardFunction:
             if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to']:
                 # Compare new heading with bearing to waypoint
                 new_hdg = actions[acid]['heading']
-                hdg_diff = abs(new_hdg - approach_bs.bearing_to_wp[idx])
+                hdg_diff = abs(new_hdg % 360 - approach_bs.bearing_to_wp[idx] % 360)
                 hdg_diff = min(hdg_diff, 360 - hdg_diff)  # Handle wrap-around
                 
                 if hdg_diff <= 30:  # Within 30 degrees of bearing to waypoint
@@ -390,16 +390,19 @@ class RewardFunction:
         
         return reward
     
-    def _calculate_sharp_turns_reward(self, idx, acid, traf, approach_bs, actions):
+
+    def _calculate_sharp_turns_reward(self, idx, acid, traf, actions):
         """Calculate reward related to sharp turns"""
         reward = 0.0
         
         # Penalty for sharp turns
-        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to']:
+        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to'] and \
+           actions[acid]['change_heading']:
+            
             new_hdg = actions[acid]['heading']
             current_trk = traf.trk[idx]
             
-            hdg_diff = abs(new_hdg - current_trk)
+            hdg_diff = abs(new_hdg % 360 - current_trk % 360)
             hdg_diff = min(hdg_diff, 360 - hdg_diff)  # Handle wrap-around
             
             if hdg_diff > 100:  # More than 100 degrees turn
@@ -407,12 +410,14 @@ class RewardFunction:
         
         return reward
     
+
     def _calculate_altitude_reward(self, idx, acid, traf, approach_bs, actions):
         """Calculate reward related to altitude changes"""
         reward = 0.0
         
         # Check if this aircraft received an altitude change command
-        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to']:
+        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to'] and \
+           actions[acid]['change_altitude']:
             new_alt = actions[acid]['altitude']
             current_alt = traf.alt[idx] / ft
             
@@ -439,13 +444,15 @@ class RewardFunction:
                     reward -= 1.0
         
         return reward
-    
+
+
     def _calculate_speed_reward(self, idx, acid, traf, approach_bs, actions):
         """Calculate reward related to speed changes"""
         reward = 0.0
         
         # Check if this aircraft received a speed change command
-        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to']:
+        if acid in actions and actions[acid]['send_command'] and not actions[acid]['direct_to'] and \
+           actions[acid]['change_speed']:
             new_spd = actions[acid]['speed']
             current_spd = traf.cas[idx] / kts
             
